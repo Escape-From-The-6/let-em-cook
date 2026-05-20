@@ -14,7 +14,7 @@ extern "C" {
    Comment‑out   #define DEBUG
    or redefine it in “Build flags” to silence every Serial.print
 *****************************************************************/
-//#define DEBUG          // ← uncomment when you DO want Serial output
+#define DEBUG          // ← uncomment when you DO want Serial output
 
 #ifdef DEBUG
   #define DPRINT(x)    Serial.print(x)
@@ -56,7 +56,7 @@ extern "C" {
 
 // LED pin definitions
 #define LED_LETTUCE 12  
-#define LED_DOUGH 13    
+#define LED_DOUGH 13     
 #define LED_MEAT 32     
 #define LED_CHEESE 33   
 #define LED_APPLE 2
@@ -147,9 +147,8 @@ int getLEDPin(const char* ingredient);
 String checkButtons();
 
 // Callback when data is sent
-void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
-    Serial.print("Last Packet Send Status: ");
-    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
+void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Send OK" : "Send Failed");
 }
 
 // Callback when data is received from the server
@@ -337,6 +336,11 @@ void setup() {
     esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
     Serial.print("Home channel: ");
     Serial.println(WiFi.channel());  // Should print 6
+
+    // Print mac address
+    Serial.println();
+    Serial.print("Pantry MAC Address:");
+    Serial.println(WiFi.macAddress());
 
     // Initialize OTA
     ArduinoOTA.onStart([]() {

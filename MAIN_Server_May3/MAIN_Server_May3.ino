@@ -39,17 +39,21 @@
 
 //#define DEBUG   // <-- uncomment when you DO want Serial output
 
-#ifndef DEBUG
 class NullSerial {
 public:
   template<typename... Args> void begin(Args...)   {}
   template<typename... Args> void print(Args...)   {}
   template<typename... Args> void println(Args...) {}
   template<typename... Args> void printf(const char*, ...) {}
+
+  int available() {
+    return 0;
+  }
+
+  String readStringUntil(char terminator) {
+    return "";
+  }
 };
-static NullSerial  __nullSerial;
-#define Serial     __nullSerial     // transparently replaces every Serial call
-#endif
 
 /*************************************************************
     WIFI CREDENTIALS (to connect to Pi's AP)
@@ -262,7 +266,7 @@ SemaphoreHandle_t xMutex;
 std::map<std::string, ClientRole> clientRoles;
 std::map<std::string, ClientRole> macToRoleMap = {
   {"C4:DE:E2:5B:81:58", ROLE_NONE},        // Server
-  {"E4:65:B8:DA:17:8C", ROLE_INGREDIENT_STATION},        // Ingredient
+  {"08:A6:F7:B1:67:88", ROLE_INGREDIENT_STATION},        // Ingredient
   {"D0:EF:76:31:63:F8", ROLE_NONE},
   {"D0:EF:76:33:59:74", ROLE_NONE},
   {"D0:EF:76:30:58:EC", ROLE_NONE},
@@ -511,6 +515,9 @@ void pickNextRecipeForRound1();
 void pickNextRecipeForRound2();
 void pickNextRecipeForRound3();
 
+// serial commands
+void handleSerialCommands();
+
 /*************************************************************
     SETUP FUNCTION
 *************************************************************/
@@ -524,6 +531,7 @@ void setup() {
   Serial.println("Scanning for WiFi networks...");
   int n = WiFi.scanNetworks();
   Serial.println("Scan done.");
+
   if (n == 0) {
     Serial.println("No networks found");
   } else {
@@ -534,31 +542,55 @@ void setup() {
       Serial.print(" (");
       Serial.print(WiFi.RSSI(i));
       Serial.print(") ");
+
       if (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) {
         Serial.println("Open");
       } else {
         Serial.println("Encrypted");
       }
+
       delay(10);
     }
   }
 
   /*************************************************
+   * Configure WiFi
+   ********************************F*****************/
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  Serial.println();
+  Serial.print("Server MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  /*************************************************
    * Connect to Pi's AP
    *************************************************/
   Serial.println("\nConnecting to scoreboard AP...");
-  WiFi.mode(WIFI_STA);
-  delay(100);
 
   // Optional: pass channel (6) if you know Pi AP is on 6
   WiFi.begin(scoreboardSSID, scoreboardPassword, 6);
 
-  while (WiFi.status() != WL_CONNECTED) {
+  unsigned long wifiStartTime = millis();
+  const unsigned long wifiTimeout = 10000; // 10 seconds
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - wifiStartTime < wifiTimeout) {
+
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nConnected to scoreboard AP!");
-  connectedToScoreboard = true;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to scoreboard AP!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    connectedToScoreboard = true;
+  } else {
+    Serial.println("\nScoreboard AP not found. Continuing without scoreboard.");
+    connectedToScoreboard = false;
+  }
 
   /*************************************************
    * Initialize OTA
@@ -566,20 +598,31 @@ void setup() {
   ArduinoOTA.onStart([]() {
     Serial.println("OTA Update Start");
   });
+
   ArduinoOTA.onEnd([]() {
     Serial.println("\nOTA Update End");
   });
+
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("OTA Progress: %u%%\n", (progress / (total / 100)));
+    Serial.printf("OTA Progress: %u%%\n",
+                  (progress / (total / 100)));
   });
+
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("OTA Error[%u]: ", error);
-    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+
+    if (error == OTA_AUTH_ERROR)
+      Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR)
+      Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR)
+      Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR)
+      Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR)
+      Serial.println("End Failed");
   });
+
   ArduinoOTA.begin();
   Serial.println("OTA Initialized");
 
@@ -587,6 +630,7 @@ void setup() {
    * Initialize mutex
    *************************************************/
   xMutex = xSemaphoreCreateMutex();
+
   if (xMutex == NULL) {
     Serial.println("Failed to create mutex.");
     return;
@@ -615,9 +659,6 @@ void setup() {
   // Set currentRound to none
   currentRound = ROUND_NONE;
 
-  // We won't automatically start a round here.
-  // We'll wait for the green button short press to do `startRound1()`.
-
   Serial.println("Server setup complete.");
 }
 
@@ -627,6 +668,8 @@ void setup() {
 void loop() {
   // Handle OTA updates
   ArduinoOTA.handle();
+
+  handleSerialCommands();
 
   /*************************************************
    * Handle GREEN BUTTON
@@ -965,6 +1008,49 @@ void startRound1() {
   roundStartQueuedAt   = millis();
 }
 
+// handle serial commands
+void handleSerialCommands() {
+  if (!Serial.available()) {
+    return;
+  }
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toLowerCase();
+
+  if (cmd == "start") {
+    if (!gameRunning && currentRound == ROUND_NONE) {
+      Serial.println("Serial command: START");
+      startRound1();
+    } else {
+      Serial.println("Game already running.");
+    }
+  }
+  else if (cmd == "end") {
+    if (gameRunning) {
+      Serial.println("Serial command: END");
+      endGame("Serial Command");
+    }
+  }
+  else if (cmd == "reset") {
+    Serial.println("Serial command: RESET");
+
+    gameRunning = false;
+    currentRound = ROUND_NONE;
+
+    reinitializeRFIDData();
+
+    pendingRoundTransition = false;
+    roundStartPending = false;
+    fireRecipePending = false;
+    recipeRebroadcastPending = false;
+    serveSuccessRecipePending = false;
+
+    onFire = false;
+    digitalWrite(FIRE_LED_PIN, LOW);
+  }
+}
+
 void assignRolesForRound1() {
   // We have 8 clients in macToRoleMap (excluding server).
   // Round 1: 3 chop, 0 cook, 1 mix, 1 order, 1 garbage, 1 ingredient, etc.
@@ -978,7 +1064,7 @@ void assignRolesForRound1() {
       continue;
     }
     // Also skip the fridge’s MAC so we don’t randomly reassign it
-    if (kv.first == "E4:65:B8:DA:17:8C") {
+    if (kv.first == "08:A6:F7:B1:67:88") {
       // Force it to remain ingredient station
       macToRoleMap[kv.first] = ROLE_INGREDIENT_STATION;
       continue;
@@ -1096,7 +1182,7 @@ void assignRolesForRound2() {
       continue;
     }
     // Also skip the fridge’s MAC so we don’t randomly reassign it
-    if (kv.first == "E4:65:B8:DA:17:8C") {
+    if (kv.first == "08:A6:F7:B1:67:88") {
       // Force it to remain ingredient station
       macToRoleMap[kv.first] = ROLE_INGREDIENT_STATION;
       continue;
@@ -1202,7 +1288,7 @@ void assignRolesForRound3() {
       continue;
     }
     // Also skip the fridge’s MAC so we don’t randomly reassign it
-    if (kv.first == "E4:65:B8:DA:17:8C") {
+    if (kv.first == "08:A6:F7:B1:67:88") {
       // Force it to remain ingredient station
       macToRoleMap[kv.first] = ROLE_INGREDIENT_STATION;
       continue;
@@ -1801,7 +1887,7 @@ void notifyPiEndGame(String reason, int finalScore) {
   Serial.print("notifyPiEndGame => HTTP code: ");
   Serial.println(httpCode);
 }
-
+  
 // Send updated score/time to Pi
 void updateScoreAndTimeOnPi(int newScore, int timeLeftSec) {
   if (!connectedToScoreboard) {
