@@ -1,48 +1,33 @@
+/*************************************************************
+  Let Em Cook - Ingredient Station / Pantry
+
+  - Uses LetEmCook shared protocol types
+  - Boots straight into ESP-NOW gameplay mode
+  - No Wi-Fi blocking during normal game mode
+  - Ingredient station owns overwriting/resetting plates
+  - Supports shared maintenance / OTA flow
+  - Uses ingredient LEDs as OTA/update indicators
+*************************************************************/
+
+#define LEC_DEBUG 1
+
+#include <LetEmCook.h>
+
 #include <esp_now.h>
 #include <WiFi.h>
 #include <MFRC522.h>
 #include <SPI.h>
-#include <DYPlayerArduino.h> // Include the DY-HV20T library
-#include <ArduinoOTA.h>      // Added OTA support
+#include <DYPlayerArduino.h>
 
 extern "C" {
   #include "esp_wifi.h"
 }
 
-/*****************************************************************
-   ─── OPTIONAL DEBUG SWITCH ──────────────────────────────────
-   Comment‑out   #define DEBUG
-   or redefine it in “Build flags” to silence every Serial.print
-*****************************************************************/
-#define DEBUG          // ← uncomment when you DO want Serial output
+/*************************************************************
+  PIN DEFINITIONS
+*************************************************************/
 
-#ifdef DEBUG
-  #define DPRINT(x)    Serial.print(x)
-  #define DPRINTLN(x)  Serial.println(x)
-#else
-  // Replace the global ‘Serial’ object with a do‑nothing stub
-  struct NullSerial_t {
-      template<typename... T> void begin(T...)   {}
-      template<typename... T> void print(T...)   {}
-      template<typename... T> void println(T...) {}
-      template<typename... T> void printf(T...)  {}
-      template<typename... T> void write(T...)   {}
-      template<typename... T> void flush(T...)   {}
-  } __nullSerial;
-
-  #define Serial   __nullSerial
-  #define DPRINT(x)
-  #define DPRINTLN(x)
-#endif
-
-
-// Constants for string lengths
-#define RFID_LENGTH 20
-#define INGREDIENT_LENGTH 30       // Increased from 20 to 30
-#define REQUEST_TYPE_LENGTH 25     // Increased from 15 to 25
-#define MAX_RECIPE_NAME_LENGTH 30  // Added to match server's struct
-
-// Pin definitions
+// RFID reader pins
 #define SS_PIN 21
 #define RST_PIN 22
 
@@ -55,42 +40,79 @@ extern "C" {
 #define BUTTON_DOUGH 35
 
 // LED pin definitions
-#define LED_LETTUCE 12  
-#define LED_DOUGH 13     
-#define LED_MEAT 32     
-#define LED_CHEESE 33   
+#define LED_LETTUCE 12
+#define LED_DOUGH 13
+#define LED_MEAT 32
+#define LED_CHEESE 33
 #define LED_APPLE 2
 #define LED_TOMATO 4
 
-#define DEBOUNCE_DELAY 300  // Debounce delay for buttons in milliseconds
-#define RFID_TIMEOUT 5000   // RFID processing timeout in milliseconds
+// Audio module pins
+#define AUDIO_TX 16
+#define AUDIO_RX 17
 
-MFRC522 rfid(SS_PIN, RST_PIN);  // Initialize RFID reader
+/*************************************************************
+  LOCAL CONSTANTS
+*************************************************************/
 
-// Server MAC address (Update this with your server's MAC address)
-uint8_t serverAddress[] = {0xC4, 0xDE, 0xE2, 0x5B, 0x81, 0x58};
+#define INGREDIENT_DEBOUNCE_MS 300
+#define HELLO_RETRY_MS 3000
 
-// Define the struct message used for communication
-typedef struct struct_message {
-    char rfid[RFID_LENGTH];
-    char ingredient[INGREDIENT_LENGTH];
-    int chopCount;
-    int cookCount;
-    int playerScoreDelta;
-    bool reset;
-    char requestType[REQUEST_TYPE_LENGTH];
-    int role;  // Added to match the server's struct
-    char recipeName[MAX_RECIPE_NAME_LENGTH]; // New field to match server
-} struct_message;
+/*************************************************************
+  HARDWARE INSTANCES
+*************************************************************/
 
-struct_message myData;     // Data to send to the server
-struct_message serverData; // Data received from the server
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+HardwareSerial audioSerial(2);
+DY::Player audioModule(&audioSerial);
+
+/*************************************************************
+  NETWORK / PACKETS
+*************************************************************/
+
+uint8_t serverAddress[6];
+
+LecPacket outgoingPacket;
+LecPacket incomingPacket;
+
+// CHANGED: Maintenance packets are queued from onDataRecv()
+// and processed in loop(), so OTA does not run inside ESP-NOW callback.
+LecPacket pendingMaintenancePacket;
+volatile bool pendingMaintenancePacketAvailable = false;
 
 volatile bool dataReceived = false;
-char lastIngredientPressed[INGREDIENT_LENGTH] = "";  // Store the last button's ingredient
-
-// New flag to track if a DataRequest has been sent
 bool requestSent = false;
+unsigned long lastHelloSentAt = 0;
+
+/*************************************************************
+  GAME STATE
+*************************************************************/
+
+char lastIngredientPressed[INGREDIENT_LENGTH] = "";
+char pendingRfid[RFID_LENGTH] = "";
+
+bool gameRunning = false;
+bool onFire = false;
+
+unsigned long lastFlashTime = 0;
+bool flashState = false;
+
+int activeLED = -1;
+int currentLEDToLightPin = -1;
+
+enum IngredientProcessState {
+  INGREDIENT_IDLE,
+  INGREDIENT_WAITING_FOR_RFID,
+  INGREDIENT_PROCESSING_RFID
+};
+
+IngredientProcessState currentState = INGREDIENT_IDLE;
+unsigned long rfidStartTime = 0;
+
+/*************************************************************
+  BUTTON STATE
+*************************************************************/
 
 // Previous state variables for edge detection
 bool previousButtonTomato = false;
@@ -100,7 +122,7 @@ bool previousButtonMeat = false;
 bool previousButtonApple = false;
 bool previousButtonDough = false;
 
-// Debounce tracking for each button
+// Debounce tracking
 unsigned long lastDebounceTomato = 0;
 unsigned long lastDebounceLettuce = 0;
 unsigned long lastDebounceCheese = 0;
@@ -108,516 +130,792 @@ unsigned long lastDebounceMeat = 0;
 unsigned long lastDebounceApple = 0;
 unsigned long lastDebounceDough = 0;
 
-// State machine for RFID processing
-enum ProcessState {
-    IDLE,
-    WAITING_FOR_RFID,
-    PROCESSING_RFID
-};
+/*************************************************************
+  FUNCTION PROTOTYPES
+*************************************************************/
 
-ProcessState currentState = IDLE;
-unsigned long rfidStartTime = 0;
+void initializePins();
+void initializeEspNow();
+void initializeAudio();
 
-// Currently active LED pin
-int activeLED = -1;
+void resetOutgoingPacket();
+void sendHelloToServer();
+void sendDataToServer(LecPacket* packet);
+void processHelloHeartbeat();
 
-// New variable to track which LED to light for 2 seconds
-int currentLEDToLightPin = -1;
+void processPendingMaintenancePacket();
 
-// Audio module pins (DY-HV20T)
-#define AUDIO_TX 16              // TX2 for the audio module
-#define AUDIO_RX 17              // RX2 for the audio module
+void sendMaintenanceResultToServer(
+  LecPacketType packetType,
+  LecPacketResult result,
+  const char* status,
+  const char* payload
+);
 
-// Initialize DYPlayer
-HardwareSerial audioSerial(2);   // Serial2 for the DY-HV20T audio module
-DY::Player audioModule(&audioSerial); // Initialize audio module
+void handleMaintenanceStatus(const char* status);
+void handleMaintenanceProgress(uint8_t percent);
 
-// --- NEW FIRE LOGIC: Global onFire flag + LED flashing ---
-bool onFire = false;
-unsigned long lastFlashTime = 0;
-bool flashState = false;
+void showMaintenanceProgress(uint8_t percent);
+void showMaintenanceActivity();
+void showMaintenanceSuccess();
+void showMaintenanceError();
 
-bool gameRunning = false;
-
-// Function prototypes
-bool PICC_IsAnyCardPresent();
-void resetData();
-void sendDataToServer(struct_message* data);
-int getLEDPin(const char* ingredient);
 String checkButtons();
+int getLEDPin(const char* ingredient);
 
-// Callback when data is sent
-void onDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t status) {
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Send OK" : "Send Failed");
+bool readCurrentRfid(char* outRfid);
+bool PICC_IsAnyCardPresent();
+
+void handlePlateStateResponse();
+void handleFireLedEffect();
+
+void playSuccessFeedback();
+void playOverwriteFeedback();
+void playErrorFeedback(const char* currentIngredient);
+
+void setAllIngredientLeds(bool state);
+void clearAllIngredientLeds();
+
+/*************************************************************
+  ESP-NOW CALLBACKS
+*************************************************************/
+
+void onDataSent(const wifi_tx_info_t* tx_info, esp_now_send_status_t status) {
+  Serial.print("Send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAILED");
 }
 
-// Callback when data is received from the server
 void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-    if (len == sizeof(struct_message)) {
-        memcpy(&serverData, data, sizeof(serverData));
+  if (len != sizeof(LecPacket)) {
+    Serial.println("Received data size mismatch.");
+    return;
+  }
 
-        // Ensure strings are null-terminated
-        serverData.rfid[RFID_LENGTH - 1] = '\0';
-        serverData.ingredient[INGREDIENT_LENGTH - 1] = '\0';
-        serverData.requestType[REQUEST_TYPE_LENGTH - 1] = '\0';
-        serverData.recipeName[MAX_RECIPE_NAME_LENGTH - 1] = '\0'; // Ensure recipeName is null-terminated
+  LecPacket received;
+  memcpy(&received, data, sizeof(received));
 
-        // Debugging: Print received data
-        Serial.println("Data received from server:");
-        Serial.print("RFID: ");
-        Serial.println(serverData.rfid);
-        Serial.print("Ingredient: ");
-        Serial.println(serverData.ingredient);
-        Serial.print("Chop Count: ");
-        Serial.println(serverData.chopCount);
-        Serial.print("Cook Count: ");
-        Serial.println(serverData.cookCount);
-        Serial.print("Player Score Delta: ");
-        Serial.println(serverData.playerScoreDelta);
-        Serial.print("Reset: ");
-        Serial.println(serverData.reset ? "true" : "false");
-        Serial.print("Request Type: ");
-        Serial.println(serverData.requestType);
-        Serial.print("Role: ");
-        Serial.println(serverData.role);
-        Serial.print("Recipe Name: ");
-        Serial.println(serverData.recipeName); // Print the recipe name
+  if (!lecIsValidPacket(received, len)) {
+    Serial.println("Invalid Let Em Cook packet received.");
+    return;
+  }
 
-        // --- NEW FIRE LOGIC: handle OnFire / ExtinguishFire ---
-        if (strcmp(serverData.requestType, "OnFire") == 0) {
-            Serial.println("Ingredient Station on FIRE!");
-            //audioModule.stop();
-            //audioModule.playSpecified(4);  // Track 4 for "fire" audio
-            onFire = true;
-        }
-        else if (strcmp(serverData.requestType, "ExtinguishFire") == 0) {
-            Serial.println("Ingredient Station Fire Extinguished.");
-            //audioModule.stop();
-            //audioModule.playSpecified(4);  // same track or different, as you like
-            onFire = false;
-            // Turn off all button LEDs
-            digitalWrite(LED_LETTUCE, LOW);
-            digitalWrite(LED_DOUGH, LOW);
-            digitalWrite(LED_MEAT, LOW);
-            digitalWrite(LED_CHEESE, LOW);
-            digitalWrite(LED_APPLE, LOW);
-            digitalWrite(LED_TOMATO, LOW);
-        }else if (strcmp(serverData.requestType, "StartRound1") == 0
-                || strcmp(serverData.requestType, "StartRound2") == 0
-                || strcmp(serverData.requestType, "StartRound3") == 0) {
-            gameRunning = true;
-        }else if (strcmp(serverData.requestType, "endgame") == 0
-                || strcmp(serverData.requestType, "Reinitialize") == 0) {
-            gameRunning = false;
-        }
-        // Otherwise set dataReceived flag only if a request was sent
-        else if (requestSent) {
-            dataReceived = true;
-        }
-    } else {
-        Serial.println("Received data size mismatch!");
-    }
+  Serial.println("=== Packet received from server ===");
+  Serial.print("Packet Type: ");
+  Serial.println(static_cast<int>(received.packetType));
+  Serial.print("Round: ");
+  Serial.println(static_cast<int>(received.round));
+  Serial.print("RFID: ");
+  Serial.println(received.rfid);
+  Serial.print("Ingredient: ");
+  Serial.println(received.ingredient);
+  Serial.print("Recipe: ");
+  Serial.println(received.recipeName);
+  Serial.print("Result: ");
+  Serial.println(static_cast<int>(received.result));
+  Serial.println("===================================");
+
+  // CHANGED: Queue maintenance/update packets instead of running OTA here.
+  if (LecMaintenance::shouldHandlePacket(received)) {
+    memcpy(&pendingMaintenancePacket, &received, sizeof(LecPacket));
+    pendingMaintenancePacketAvailable = true;
+    return;
+  }
+
+  memcpy(&incomingPacket, &received, sizeof(LecPacket));
+
+  switch (incomingPacket.packetType) {
+    case LEC_PKT_START_ROUND:
+      if (incomingPacket.round == LEC_ROUND_1 ||
+          incomingPacket.round == LEC_ROUND_2) {
+        gameRunning = true;
+        onFire = false;
+        clearAllIngredientLeds();
+        Serial.println("Ingredient station enabled for round.");
+      }
+      break;
+
+    case LEC_PKT_END_ROUND:
+    case LEC_PKT_END_GAME:
+    case LEC_PKT_REINITIALIZE:
+      gameRunning = false;
+      onFire = false;
+      requestSent = false;
+      dataReceived = false;
+      currentState = INGREDIENT_IDLE;
+      clearAllIngredientLeds();
+      Serial.println("Ingredient station stopped.");
+      break;
+
+    case LEC_PKT_ON_FIRE:
+      onFire = true;
+      Serial.println("Ingredient station is on FIRE.");
+      break;
+
+    case LEC_PKT_EXTINGUISH_FIRE:
+      onFire = false;
+      clearAllIngredientLeds();
+      Serial.println("Ingredient station fire extinguished.");
+      break;
+
+    case LEC_PKT_PLATE_STATE:
+      if (requestSent) {
+        dataReceived = true;
+      }
+      break;
+
+    default:
+      break;
+  }
 }
 
-void resetData() {
-    memset(&myData, 0, sizeof(myData));
-    myData.chopCount = -1;  // Set to -1 to indicate no change
-    myData.cookCount = -1;  // Set to -1 to indicate no change
-    myData.playerScoreDelta = 0; // Initialize to 0
-    myData.reset = false;
-    myData.role = 0;        // Set role to 0 (not used in this client)
-    lastIngredientPressed[0] = '\0';  // Clear the last ingredient pressed
-    myData.recipeName[0] = '\0'; // Clear the recipeName
+/*************************************************************
+  SETUP
+*************************************************************/
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println();
+  Serial.println("Booting Let Em Cook Ingredient Station...");
+
+  memcpy(serverAddress, LEC_DEFAULT_SERVER_MAC, 6);
+
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  Serial.print("Ingredient Station MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  SPI.begin();
+  rfid.PCD_Init();
+
+  esp_wifi_set_channel(LEC_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  Serial.print("ESP-NOW Channel: ");
+  Serial.println(LEC_ESPNOW_CHANNEL);
+
+  initializePins();
+  initializeEspNow();
+  initializeAudio();
+
+  resetOutgoingPacket();
+  memset(&incomingPacket, 0, sizeof(incomingPacket));
+  memset(&pendingMaintenancePacket, 0, sizeof(pendingMaintenancePacket));
+
+  sendHelloToServer();
+
+  // Pantry stays ESP-NOW only during normal gameplay.
+  // Wi-Fi is only used when an OTA/update packet is received.
+  LecMaintenance::begin(
+    LEC_DEVICE_INGREDIENT_STATION,
+    handleMaintenanceStatus,
+    handleMaintenanceProgress,
+    sendMaintenanceResultToServer
+  );
+
+  Serial.print("Size of LecPacket: ");
+  Serial.println(sizeof(LecPacket));
+
+  Serial.println("Ingredient Station ready.");
 }
 
-void sendDataToServer(struct_message* data) {
-    esp_err_t result = esp_now_send(serverAddress, (uint8_t*)data, sizeof(struct_message));
-    if (result == ESP_OK) {
-        Serial.println("Data sent to server.");
-    } else {
-        Serial.print("Error sending data: ");
-        Serial.println(result);
+/*************************************************************
+  LOOP
+*************************************************************/
+
+void loop() {
+  LecMaintenance::tick();
+
+  processPendingMaintenancePacket();
+
+  processHelloHeartbeat();
+
+  // CHANGED: During maintenance/update, do not process pantry gameplay.
+  if (LecMaintenance::isMaintenanceMode()) {
+    delay(25);
+    return;
+  }
+
+  if (!gameRunning) {
+    delay(50);
+    return;
+  }
+
+  if (onFire) {
+    handleFireLedEffect();
+    delay(10);
+    return;
+  }
+
+  String ingredient = checkButtons();
+
+  if (ingredient.length() > 0) {
+    strncpy(lastIngredientPressed, ingredient.c_str(), INGREDIENT_LENGTH - 1);
+    lastIngredientPressed[INGREDIENT_LENGTH - 1] = '\0';
+
+    int ledPin = getLEDPin(lastIngredientPressed);
+
+    if (ledPin != -1) {
+      digitalWrite(ledPin, HIGH);
+      activeLED = ledPin;
     }
+
+    if (currentState == INGREDIENT_IDLE) {
+      currentState = INGREDIENT_WAITING_FOR_RFID;
+      rfidStartTime = millis();
+
+      if (readCurrentRfid(pendingRfid)) {
+        Serial.print("RFID detected: ");
+        Serial.println(pendingRfid);
+
+        lecInitPacket(
+          outgoingPacket,
+          LEC_PKT_PLATE_LOOKUP,
+          LEC_DEVICE_INGREDIENT_STATION,
+          LEC_ROLE_INGREDIENT_STATION
+        );
+
+        lecSetRfid(outgoingPacket, pendingRfid);
+
+        memset(&incomingPacket, 0, sizeof(incomingPacket));
+
+        sendDataToServer(&outgoingPacket);
+
+        requestSent = true;
+        dataReceived = false;
+
+        currentState = INGREDIENT_PROCESSING_RFID;
+        rfidStartTime = millis();
+      } else {
+        Serial.println("No RFID card detected.");
+
+        currentState = INGREDIENT_IDLE;
+
+        if (activeLED != -1) {
+          digitalWrite(activeLED, LOW);
+          activeLED = -1;
+        }
+      }
+    }
+  }
+
+  if (currentState == INGREDIENT_PROCESSING_RFID) {
+    if (dataReceived &&
+        requestSent &&
+        incomingPacket.packetType == LEC_PKT_PLATE_STATE) {
+      handlePlateStateResponse();
+    } else if (millis() - rfidStartTime > LEC_RFID_TIMEOUT_MS) {
+      Serial.println("Timeout waiting for server plate response.");
+
+      if (activeLED != -1) {
+        digitalWrite(activeLED, LOW);
+        activeLED = -1;
+      }
+
+      requestSent = false;
+      dataReceived = false;
+      currentState = INGREDIENT_IDLE;
+    }
+  }
+
+  if (currentLEDToLightPin != -1) {
+    digitalWrite(currentLEDToLightPin, HIGH);
+    delay(500);
+    digitalWrite(currentLEDToLightPin, LOW);
+    currentLEDToLightPin = -1;
+  }
+}
+
+/*************************************************************
+  INITIALIZATION HELPERS
+*************************************************************/
+
+void initializePins() {
+  pinMode(BUTTON_TOMATO, INPUT_PULLDOWN);
+
+  // GPIO 34 and GPIO 35 are input-only pins and do not support internal pull-down.
+  // These require external resistors if your button circuit needs a defined LOW state.
+  pinMode(BUTTON_LETTUCE, INPUT);
+  pinMode(BUTTON_DOUGH, INPUT);
+
+  pinMode(BUTTON_CHEESE, INPUT_PULLDOWN);
+  pinMode(BUTTON_MEAT, INPUT_PULLDOWN);
+  pinMode(BUTTON_APPLE, INPUT_PULLDOWN);
+
+  pinMode(LED_LETTUCE, OUTPUT);
+  pinMode(LED_DOUGH, OUTPUT);
+  pinMode(LED_MEAT, OUTPUT);
+  pinMode(LED_CHEESE, OUTPUT);
+  pinMode(LED_APPLE, OUTPUT);
+  pinMode(LED_TOMATO, OUTPUT);
+
+  clearAllIngredientLeds();
+}
+
+void initializeEspNow() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW.");
+    return;
+  }
+
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataRecv);
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, serverAddress, 6);
+  peerInfo.channel = LEC_ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+
+  if (esp_now_is_peer_exist(serverAddress)) {
+    Serial.println("Server peer already exists.");
+  } else if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add server peer.");
+    return;
+  }
+
+  Serial.println("ESP-NOW initialized.");
+}
+
+void initializeAudio() {
+  audioSerial.begin(9600, SERIAL_8N1, AUDIO_RX, AUDIO_TX);
+  audioModule.begin();
+  audioModule.setCycleMode(DY::PlayMode::OneOff);
+  audioModule.setVolume(24);
+  audioModule.stop();
+
+  Serial.println("Audio initialized.");
+}
+
+/*************************************************************
+  MAINTENANCE / OTA HELPERS
+*************************************************************/
+
+void processPendingMaintenancePacket() {
+  if (!pendingMaintenancePacketAvailable) {
+    return;
+  }
+
+  LecPacket packetToHandle;
+  memcpy(&packetToHandle, &pendingMaintenancePacket, sizeof(LecPacket));
+
+  pendingMaintenancePacketAvailable = false;
+
+  LecMaintenance::handlePacket(packetToHandle);
+}
+
+void sendMaintenanceResultToServer(
+  LecPacketType packetType,
+  LecPacketResult result,
+  const char* status,
+  const char* payload
+) {
+  LecPacket response;
+
+  lecInitPacket(
+    response,
+    packetType,
+    LEC_DEVICE_INGREDIENT_STATION,
+    LEC_ROLE_INGREDIENT_STATION
+  );
+
+  response.result = result;
+  response.runMode = LecMaintenance::getRunMode();
+
+  if (status != nullptr) {
+    lecSetStatus(response, status);
+  }
+
+  if (payload != nullptr) {
+    lecSetPayload(response, payload);
+  }
+
+  sendDataToServer(&response);
+}
+
+void handleMaintenanceStatus(const char* status) {
+  if (status == nullptr) return;
+
+  Serial.print("Maintenance status: ");
+  Serial.println(status);
+
+  if (strcmp(status, "maintenance-requested") == 0 ||
+      strcmp(status, "net-config-saved") == 0 ||
+      strcmp(status, "wifi-connecting") == 0 ||
+      strcmp(status, "ota-starting") == 0 ||
+      strcmp(status, "ota-http-begin") == 0 ||
+      strcmp(status, "ota-update-begin") == 0) {
+    showMaintenanceActivity();
+  }
+  else if (strcmp(status, "ota-success") == 0) {
+    showMaintenanceSuccess();
+  }
+  else if (strcmp(status, "ota-failed") == 0 ||
+           strcmp(status, "wifi-failed") == 0 ||
+           strcmp(status, "maintenance-idle-timeout") == 0) {
+    showMaintenanceError();
+  }
+  else if (strcmp(status, "maintenance-exit") == 0) {
+    clearAllIngredientLeds();
+  }
+}
+
+void handleMaintenanceProgress(uint8_t percent) {
+  showMaintenanceProgress(percent);
+}
+
+void showMaintenanceActivity() {
+  for (int i = 0; i < 2; i++) {
+    setAllIngredientLeds(true);
+    delay(120);
+    setAllIngredientLeds(false);
+    delay(120);
+  }
+}
+
+void showMaintenanceProgress(uint8_t percent) {
+  if (percent > 100) {
+    percent = 100;
+  }
+
+  int ledCount = map(percent, 0, 100, 0, 6);
+
+  digitalWrite(LED_LETTUCE, ledCount >= 1 ? HIGH : LOW);
+  digitalWrite(LED_TOMATO,  ledCount >= 2 ? HIGH : LOW);
+  digitalWrite(LED_CHEESE,  ledCount >= 3 ? HIGH : LOW);
+  digitalWrite(LED_MEAT,    ledCount >= 4 ? HIGH : LOW);
+  digitalWrite(LED_APPLE,   ledCount >= 5 ? HIGH : LOW);
+  digitalWrite(LED_DOUGH,   ledCount >= 6 ? HIGH : LOW);
+}
+
+void showMaintenanceSuccess() {
+  for (int i = 0; i < 3; i++) {
+    setAllIngredientLeds(true);
+    delay(150);
+    setAllIngredientLeds(false);
+    delay(150);
+  }
+}
+
+void showMaintenanceError() {
+  for (int i = 0; i < 5; i++) {
+    setAllIngredientLeds(true);
+    delay(80);
+    setAllIngredientLeds(false);
+    delay(80);
+  }
+}
+
+/*************************************************************
+  PACKET HELPERS
+*************************************************************/
+
+void resetOutgoingPacket() {
+  lecInitPacket(
+    outgoingPacket,
+    LEC_PKT_NONE,
+    LEC_DEVICE_INGREDIENT_STATION,
+    LEC_ROLE_INGREDIENT_STATION
+  );
+
+  lastIngredientPressed[0] = '\0';
+}
+
+void sendHelloToServer() {
+  LecPacket hello;
+
+  lecInitPacket(
+    hello,
+    LEC_PKT_HELLO,
+    LEC_DEVICE_INGREDIENT_STATION,
+    LEC_ROLE_INGREDIENT_STATION
+  );
+
+  lecSetStatus(hello, "ingredient-online");
+
+  lastHelloSentAt = millis();
+
+  sendDataToServer(&hello);
+}
+
+void processHelloHeartbeat() {
+  if (LecMaintenance::isMaintenanceMode()) {
+    return;
+  }
+
+  // Keep announcing while the pantry is not actively in a game.
+  if (gameRunning) {
+    return;
+  }
+
+  if (millis() - lastHelloSentAt < HELLO_RETRY_MS) {
+    return;
+  }
+
+  lastHelloSentAt = millis();
+
+  Serial.println("Sending ingredient HELLO heartbeat to server...");
+  sendHelloToServer();
+}
+
+void sendDataToServer(LecPacket* packet) {
+  if (packet == nullptr) return;
+
+  packet->protocolVersion = LEC_PROTOCOL_VERSION;
+  packet->packetSize = sizeof(LecPacket);
+  packet->uptimeMs = millis();
+  packet->deviceClass = LEC_DEVICE_INGREDIENT_STATION;
+  packet->role = LEC_ROLE_INGREDIENT_STATION;
+
+  // Report actual mode, GAME / MAINT / BULK_OTA / REBOOTING.
+  packet->runMode = LecMaintenance::getRunMode();
+
+  esp_err_t result = esp_now_send(
+    serverAddress,
+    reinterpret_cast<uint8_t*>(packet),
+    sizeof(LecPacket)
+  );
+
+  if (result == ESP_OK) {
+    Serial.println("Packet sent to server.");
+  } else {
+    Serial.print("Error sending packet: ");
+    Serial.println(result);
+  }
+}
+
+/*************************************************************
+  GAME LOGIC
+*************************************************************/
+
+void handlePlateStateResponse() {
+  dataReceived = false;
+  requestSent = false;
+
+  Serial.println("Handling plate state response.");
+
+  bool plateHadIngredient =
+    incomingPacket.ingredient[0] != '\0' &&
+    strcmp(incomingPacket.ingredient, "none") != 0;
+
+  lecInitPacket(
+    outgoingPacket,
+    LEC_PKT_PLATE_UPDATE,
+    LEC_DEVICE_INGREDIENT_STATION,
+    LEC_ROLE_INGREDIENT_STATION
+  );
+
+  lecSetRfid(outgoingPacket, pendingRfid);
+  lecSetIngredient(outgoingPacket, lastIngredientPressed);
+
+  outgoingPacket.chopCount = INVALID_COUNT;
+  outgoingPacket.cookCount = INVALID_COUNT;
+  outgoingPacket.bakeCount = INVALID_COUNT;
+  outgoingPacket.playerScoreDelta = 0;
+
+  // Ingredient station handles resetting/overwriting plate ingredient.
+  outgoingPacket.resetPlate = plateHadIngredient;
+  outgoingPacket.success = true;
+
+  sendDataToServer(&outgoingPacket);
+
+  currentLEDToLightPin = getLEDPin(lastIngredientPressed);
+
+  if (plateHadIngredient) {
+    Serial.print("Overwriting existing ingredient: ");
+    Serial.println(incomingPacket.ingredient);
+    playOverwriteFeedback();
+  } else {
+    Serial.println("Writing new ingredient to plate.");
+    playSuccessFeedback();
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  resetOutgoingPacket();
+  memset(&incomingPacket, 0, sizeof(incomingPacket));
+  pendingRfid[0] = '\0';
+
+  if (activeLED != -1) {
+    digitalWrite(activeLED, LOW);
+    activeLED = -1;
+  }
+
+  currentState = INGREDIENT_IDLE;
+}
+
+/*************************************************************
+  BUTTONS
+*************************************************************/
+
+String checkButtons() {
+  String ingredient = "";
+  unsigned long currentTime = millis();
+
+  if (digitalRead(BUTTON_TOMATO) == HIGH && !previousButtonTomato) {
+    if (currentTime - lastDebounceTomato > INGREDIENT_DEBOUNCE_MS) {
+      lastDebounceTomato = currentTime;
+      ingredient = "tomato";
+      Serial.println("Button pressed: TOMATO");
+    }
+  }
+  previousButtonTomato = digitalRead(BUTTON_TOMATO) == HIGH;
+
+  if (digitalRead(BUTTON_LETTUCE) == HIGH && !previousButtonLettuce) {
+    if (currentTime - lastDebounceLettuce > INGREDIENT_DEBOUNCE_MS) {
+      lastDebounceLettuce = currentTime;
+      ingredient = "lettuce";
+      Serial.println("Button pressed: LETTUCE");
+    }
+  }
+  previousButtonLettuce = digitalRead(BUTTON_LETTUCE) == HIGH;
+
+  if (digitalRead(BUTTON_CHEESE) == HIGH && !previousButtonCheese) {
+    if (currentTime - lastDebounceCheese > INGREDIENT_DEBOUNCE_MS) {
+      lastDebounceCheese = currentTime;
+      ingredient = "cheese";
+      Serial.println("Button pressed: CHEESE");
+    }
+  }
+  previousButtonCheese = digitalRead(BUTTON_CHEESE) == HIGH;
+
+  if (digitalRead(BUTTON_MEAT) == HIGH && !previousButtonMeat) {
+    if (currentTime - lastDebounceMeat > INGREDIENT_DEBOUNCE_MS) {
+      lastDebounceMeat = currentTime;
+      ingredient = "meat";
+      Serial.println("Button pressed: MEAT");
+    }
+  }
+  previousButtonMeat = digitalRead(BUTTON_MEAT) == HIGH;
+
+  if (digitalRead(BUTTON_APPLE) == HIGH && !previousButtonApple) {
+    if (currentTime - lastDebounceApple > INGREDIENT_DEBOUNCE_MS) {
+      lastDebounceApple = currentTime;
+      ingredient = "apple";
+      Serial.println("Button pressed: APPLE");
+    }
+  }
+  previousButtonApple = digitalRead(BUTTON_APPLE) == HIGH;
+
+  if (digitalRead(BUTTON_DOUGH) == HIGH && !previousButtonDough) {
+    if (currentTime - lastDebounceDough > INGREDIENT_DEBOUNCE_MS) {
+      lastDebounceDough = currentTime;
+      ingredient = "dough";
+      Serial.println("Button pressed: DOUGH");
+    }
+  }
+  previousButtonDough = digitalRead(BUTTON_DOUGH) == HIGH;
+
+  return ingredient;
 }
 
 int getLEDPin(const char* ingredient) {
-    if (strcmp(ingredient, "lettuce") == 0) return LED_LETTUCE;
-    if (strcmp(ingredient, "dough") == 0) return LED_DOUGH;
-    if (strcmp(ingredient, "meat") == 0) return LED_MEAT;
-    if (strcmp(ingredient, "cheese") == 0) return LED_CHEESE;
-    if (strcmp(ingredient, "apple") == 0) return LED_APPLE;
-    if (strcmp(ingredient, "tomato") == 0) return LED_TOMATO;
-    return -1;  // Invalid ingredient
+  if (strcmp(ingredient, "lettuce") == 0) return LED_LETTUCE;
+  if (strcmp(ingredient, "tomato") == 0) return LED_TOMATO;
+  if (strcmp(ingredient, "cheese") == 0) return LED_CHEESE;
+  if (strcmp(ingredient, "meat") == 0) return LED_MEAT;
+  if (strcmp(ingredient, "apple") == 0) return LED_APPLE;
+  if (strcmp(ingredient, "dough") == 0) return LED_DOUGH;
+
+  return -1;
 }
 
-String checkButtons() {
-    String ingredient = "";
-    unsigned long currentTime = millis();
+/*************************************************************
+  RFID
+*************************************************************/
 
-    // Check Tomato Button
-    if (digitalRead(BUTTON_TOMATO) == HIGH && !previousButtonTomato) {
-        if (currentTime - lastDebounceTomato > DEBOUNCE_DELAY) {
-            lastDebounceTomato = currentTime;
-            ingredient = "tomato";
-            Serial.println("Button pressed: TOMATO");
-        }
-    }
-    previousButtonTomato = (digitalRead(BUTTON_TOMATO) == HIGH);
+bool readCurrentRfid(char* outRfid) {
+  if (outRfid == nullptr) return false;
 
-    // Check Lettuce Button
-    if (digitalRead(BUTTON_LETTUCE) == HIGH && !previousButtonLettuce) {
-        if (currentTime - lastDebounceLettuce > DEBOUNCE_DELAY) {
-            lastDebounceLettuce = currentTime;
-            ingredient = "lettuce";
-            Serial.println("Button pressed: LETTUCE");
-        }
-    }
-    previousButtonLettuce = (digitalRead(BUTTON_LETTUCE) == HIGH);
+  if (!PICC_IsAnyCardPresent()) {
+    return false;
+  }
 
-    // Check Cheese Button
-    if (digitalRead(BUTTON_CHEESE) == HIGH && !previousButtonCheese) {
-        if (currentTime - lastDebounceCheese > DEBOUNCE_DELAY) {
-            lastDebounceCheese = currentTime;
-            ingredient = "cheese";
-            Serial.println("Button pressed: CHEESE");
-        }
-    }
-    previousButtonCheese = (digitalRead(BUTTON_CHEESE) == HIGH);
+  if (!rfid.PICC_ReadCardSerial()) {
+    return false;
+  }
 
-    // Check Meat Button
-    if (digitalRead(BUTTON_MEAT) == HIGH && !previousButtonMeat) {
-        if (currentTime - lastDebounceMeat > DEBOUNCE_DELAY) {
-            lastDebounceMeat = currentTime;
-            ingredient = "meat";
-            Serial.println("Button pressed: MEAT");
-        }
-    }
-    previousButtonMeat = (digitalRead(BUTTON_MEAT) == HIGH);
+  snprintf(
+    outRfid,
+    RFID_LENGTH,
+    "%02X%02X%02X%02X",
+    rfid.uid.uidByte[0],
+    rfid.uid.uidByte[1],
+    rfid.uid.uidByte[2],
+    rfid.uid.uidByte[3]
+  );
 
-    // Check Apple Button
-    if (digitalRead(BUTTON_APPLE) == HIGH && !previousButtonApple) {
-        if (currentTime - lastDebounceApple > DEBOUNCE_DELAY) {
-            lastDebounceApple = currentTime;
-            ingredient = "apple";
-            Serial.println("Button pressed: APPLE");
-        }
-    }
-    previousButtonApple = (digitalRead(BUTTON_APPLE) == HIGH);
+  outRfid[RFID_LENGTH - 1] = '\0';
 
-    // Check Dough Button
-    if (digitalRead(BUTTON_DOUGH) == HIGH && !previousButtonDough) {
-        if (currentTime - lastDebounceDough > DEBOUNCE_DELAY) {
-            lastDebounceDough = currentTime;
-            ingredient = "dough";
-            Serial.println("Button pressed: DOUGH");
-        }
-    }
-    previousButtonDough = (digitalRead(BUTTON_DOUGH) == HIGH);
-
-    return ingredient;
+  return true;
 }
 
-void setup() {
-    Serial.begin(115200);
-    // Force channel 6 so it matches the server's channel
-    WiFi.mode(WIFI_STA);
-    delay(100);
-    // Connect to WiFi (required for OTA)
-    WiFi.begin("MyScoreboardAP", "MySecretPassword"); // Replace with your network credentials
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      Serial.print(".");
-    }
-    Serial.println("\nWiFi connected, IP address: ");
-    Serial.println(WiFi.localIP());
-    
-    // Set channel for ESP-NOW
-    SPI.begin();
-    esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
-    Serial.print("Home channel: ");
-    Serial.println(WiFi.channel());  // Should print 6
-
-    // Print mac address
-    Serial.println();
-    Serial.print("Pantry MAC Address:");
-    Serial.println(WiFi.macAddress());
-
-    // Initialize OTA
-    ArduinoOTA.onStart([]() {
-      Serial.println("OTA Update Start");
-    });
-    ArduinoOTA.onEnd([]() {
-      Serial.println("\nOTA Update End");
-    });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      Serial.printf("OTA Progress: %u%%\n", (progress / (total / 100)));
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-      Serial.printf("OTA Error[%u]: ", error);
-      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-      else if (error == OTA_END_ERROR) Serial.println("End Failed");
-    });
-    ArduinoOTA.begin();
-    Serial.println("OTA Initialized");
-
-    rfid.PCD_Init();
-
-    // Set button pins as INPUT_PULLDOWN
-    pinMode(BUTTON_TOMATO, INPUT_PULLDOWN);
-    pinMode(BUTTON_LETTUCE, INPUT_PULLDOWN);
-    pinMode(BUTTON_CHEESE, INPUT_PULLDOWN);
-    pinMode(BUTTON_MEAT, INPUT_PULLDOWN);
-    pinMode(BUTTON_APPLE, INPUT_PULLDOWN);
-    pinMode(BUTTON_DOUGH, INPUT_PULLDOWN);
-
-    // Set LED pins as OUTPUT
-    pinMode(LED_LETTUCE, OUTPUT);
-    pinMode(LED_DOUGH, OUTPUT);
-    pinMode(LED_MEAT, OUTPUT);
-    pinMode(LED_CHEESE, OUTPUT);
-    pinMode(LED_APPLE, OUTPUT);
-    pinMode(LED_TOMATO, OUTPUT);
-
-    // Initialize all LEDs to OFF
-    digitalWrite(LED_LETTUCE, LOW);
-    digitalWrite(LED_DOUGH, LOW);
-    digitalWrite(LED_MEAT, LOW);
-    digitalWrite(LED_CHEESE, LOW);
-    digitalWrite(LED_APPLE, LOW);
-    digitalWrite(LED_TOMATO, LOW);
-
-    // Initialize ESP-NOW
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("Error initializing ESP-NOW");
-        return;
-    }
-
-    esp_now_register_send_cb(onDataSent);
-    esp_now_register_recv_cb(onDataRecv);
-
-    // Add server as a peer
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, serverAddress, 6);
-    peerInfo.channel = 6;
-    peerInfo.encrypt = false;
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("Failed to add server peer");
-        return;
-    }
-
-    resetData();  // Initialize myData
-    memset(&serverData, 0, sizeof(serverData));  // Initialize serverData
-
-    // Initialize DY-HV20T audio module
-    audioSerial.begin(9600, SERIAL_8N1, AUDIO_RX, AUDIO_TX);  // Define RX/TX pins
-    audioModule.begin();  // No arguments needed
-    audioModule.setCycleMode(DY::PlayMode::OneOff);
-    audioModule.setVolume(24);
-    audioModule.stop();  // Reset the audio module
-
-    Serial.print("Size of struct_message: ");
-    Serial.println(sizeof(struct_message));  // Debugging: Print struct size
-
-    Serial.println("Fridge Client ready.");
-}
-
-void loop() {
-    // Handle OTA updates
-    ArduinoOTA.handle();
-
-    if (!gameRunning) {
-        delay(50);          // lighten the watchdog
-        return;             // do nothing until a round starts
-    }
-
-
-    // --- NEW FIRE LOGIC: If onFire, just flash all button LEDs and skip logic ---
-    if (onFire) {
-        if (millis() - lastFlashTime > 500) {
-            lastFlashTime = millis();
-            flashState = !flashState;
-
-            digitalWrite(LED_LETTUCE, flashState);
-            digitalWrite(LED_DOUGH,   flashState);
-            digitalWrite(LED_MEAT,    flashState);
-            digitalWrite(LED_CHEESE,  flashState);
-            digitalWrite(LED_APPLE,   flashState);
-            digitalWrite(LED_TOMATO,  flashState);
-        }
-        return; // Skip normal operation if on fire
-    }
-
-    String ingredient = checkButtons();
-
-    if (ingredient != "") {
-        // Update last ingredient pressed
-        strncpy(lastIngredientPressed, ingredient.c_str(), INGREDIENT_LENGTH - 1);
-        lastIngredientPressed[INGREDIENT_LENGTH - 1] = '\0';
-
-        // Get the corresponding LED pin
-        int ledPin = getLEDPin(lastIngredientPressed);
-        if (ledPin != -1) {
-            digitalWrite(ledPin, HIGH); // Turn on LED
-            activeLED = ledPin;
-        }
-
-        // Proceed only if in IDLE state
-        if (currentState == IDLE) {
-            currentState = WAITING_FOR_RFID;
-            rfidStartTime = millis();
-
-            // Initiate RFID reading
-            if (PICC_IsAnyCardPresent() && rfid.PICC_ReadCardSerial()) {
-                // Format the RFID UID
-                snprintf(myData.rfid, RFID_LENGTH, "%02X%02X%02X%02X",
-                         rfid.uid.uidByte[0], rfid.uid.uidByte[1],
-                         rfid.uid.uidByte[2], rfid.uid.uidByte[3]);
-                myData.rfid[RFID_LENGTH - 1] = '\0';  // Ensure null-termination
-
-                Serial.print("RFID detected: ");
-                Serial.println(myData.rfid);
-
-                // Prepare DataRequest message
-                strncpy(myData.requestType, "DataRequest", REQUEST_TYPE_LENGTH - 1);
-                myData.requestType[REQUEST_TYPE_LENGTH - 1] = '\0';
-                myData.recipeName[0] = '\0'; // Clear recipeName
-
-                // Clear serverData before sending a new request
-                memset(&serverData, 0, sizeof(serverData));
-
-                // Send DataRequest to server
-                sendDataToServer(&myData);
-
-                // Set the requestSent flag
-                requestSent = true;
-
-                // Transition to PROCESSING_RFID state
-                currentState = PROCESSING_RFID;
-                rfidStartTime = millis();
-            } else {
-                Serial.println("No RFID card detected.");
-                currentState = IDLE;
-                // Turn off the LED if RFID not detected
-                if (activeLED != -1) {
-                    digitalWrite(activeLED, LOW);
-                    activeLED = -1;
-                }
-            }
-        }
-    }
-
-    // Handle RFID processing
-    if (currentState == PROCESSING_RFID) {
-        if (dataReceived && requestSent && strcmp(serverData.requestType, "DataResponse") == 0) {
-            dataReceived = false;    // Reset the flag
-            requestSent = false;     // Reset the requestSent flag
-
-            // Determine which LED to light based on the conditions
-            if (strcmp(serverData.ingredient, "none") == 0) {
-
-                Serial.println("Updating ingredient on server.");
-
-                // Prepare DataUpdate message
-                strncpy(myData.ingredient, lastIngredientPressed, INGREDIENT_LENGTH - 1);
-                myData.ingredient[INGREDIENT_LENGTH - 1] = '\0';
-                strncpy(myData.requestType, "DataUpdate", REQUEST_TYPE_LENGTH - 1);
-                myData.requestType[REQUEST_TYPE_LENGTH - 1] = '\0';
-                myData.chopCount = -1;  // No change
-                myData.cookCount = -1;  // No change
-                myData.playerScoreDelta = 0; // No score change
-                myData.reset = false;
-                myData.recipeName[0] = '\0'; // Clear recipeName
-
-                // Send DataUpdate to server
-                sendDataToServer(&myData);
-
-                // Set LED to the pressed ingredient
-                currentLEDToLightPin = getLEDPin(lastIngredientPressed);
-
-                // Play track 00001
-                audioModule.stop();
-                audioModule.playSpecified(1);  // Play track 00001
-
-            }
-            else {
-                Serial.println("Ingredient already present – cannot switch.");
-                playErrorFeedback(serverData.ingredient);
-            }
-
-            // Optionally, you can utilize the recipeName here
-            if (strlen(serverData.recipeName) > 0) {
-                Serial.print("Current Recipe: ");
-                Serial.println(serverData.recipeName);
-                // Add any additional logic to handle the recipe name
-            }
-
-            // Reset RFID state for next loop
-            rfid.PICC_HaltA();
-            rfid.PCD_StopCrypto1();
-            resetData();  // Reset myData
-            memset(&serverData, 0, sizeof(serverData));  // Clear serverData
-
-            // Turn off the active LED after processing
-            if (activeLED != -1) {
-                digitalWrite(activeLED, LOW);
-                activeLED = -1;
-            }
-
-            currentState = IDLE;
-        }
-        else if (millis() - rfidStartTime > RFID_TIMEOUT) {
-            Serial.println("Timeout waiting for server response.");
-            // Turn off the LED on timeout
-            if (activeLED != -1) {
-                digitalWrite(activeLED, LOW);
-                activeLED = -1;
-            }
-            currentState = IDLE;
-            requestSent = false;  // Reset the requestSent flag
-        }
-    }
-
-    // At the end of the loop, handle the LED indication
-    if (currentLEDToLightPin != -1) {
-        digitalWrite(currentLEDToLightPin, HIGH); // Turn on the LED
-        delay(2000); // Wait for 2 seconds (blocking)
-        digitalWrite(currentLEDToLightPin, LOW);  // Turn off the LED
-        currentLEDToLightPin = -1; // Reset the variable
-    }
-}
-
-// Helper function to check if any card is present
 bool PICC_IsAnyCardPresent() {
-    byte bufferATQA[2];
-    byte bufferSize = sizeof(bufferATQA);
-    rfid.PCD_WriteRegister(rfid.TxModeReg, 0x00);
-    rfid.PCD_WriteRegister(rfid.RxModeReg, 0x00);
-    rfid.PCD_WriteRegister(rfid.ModWidthReg, 0x26);
-    MFRC522::StatusCode result = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
-    return (result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION);
+  byte bufferATQA[2];
+  byte bufferSize = sizeof(bufferATQA);
+
+  rfid.PCD_WriteRegister(rfid.TxModeReg, 0x00);
+  rfid.PCD_WriteRegister(rfid.RxModeReg, 0x00);
+  rfid.PCD_WriteRegister(rfid.ModWidthReg, 0x26);
+
+  MFRC522::StatusCode result = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+
+  return result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION;
+}
+
+/*************************************************************
+  LED / FIRE / AUDIO FEEDBACK
+*************************************************************/
+
+void handleFireLedEffect() {
+  if (millis() - lastFlashTime > 500) {
+    lastFlashTime = millis();
+    flashState = !flashState;
+
+    setAllIngredientLeds(flashState);
+  }
+}
+
+void setAllIngredientLeds(bool state) {
+  digitalWrite(LED_LETTUCE, state ? HIGH : LOW);
+  digitalWrite(LED_DOUGH, state ? HIGH : LOW);
+  digitalWrite(LED_TOMATO, state ? HIGH : LOW);
+  digitalWrite(LED_MEAT, state ? HIGH : LOW);
+  digitalWrite(LED_CHEESE, state ? HIGH : LOW);
+  digitalWrite(LED_APPLE, state ? HIGH : LOW);
+}
+
+void clearAllIngredientLeds() {
+  setAllIngredientLeds(false);
+}
+
+void playSuccessFeedback() {
+  audioModule.stop();
+  audioModule.playSpecified(1);
+}
+
+void playOverwriteFeedback() {
+  audioModule.stop();
+  audioModule.playSpecified(1);
 }
 
 void playErrorFeedback(const char* currentIngredient) {
-    // 1) error sound  (choose any free track number, here #9)
-    audioModule.stop();
-    audioModule.playSpecified(2);
+  audioModule.stop();
+  audioModule.playSpecified(2);
 
-    // 2) blink ALL six button LEDs 3×
-    const int leds[] = {LED_LETTUCE, LED_DOUGH, LED_MEAT,
-                        LED_CHEESE,  LED_APPLE, LED_TOMATO};
-    for (int b = 0; b < 3; b++) {
-        for (int i = 0; i < 6; i++) digitalWrite(leds[i], HIGH);
-        delay(150);
-        for (int i = 0; i < 6; i++) digitalWrite(leds[i], LOW);
-        delay(150);
-    }
+  for (int blink = 0; blink < 3; blink++) {
+    setAllIngredientLeds(true);
+    delay(150);
+    setAllIngredientLeds(false);
+    delay(150);
+  }
 
-    // 3) light the LED that matches the ingredient already on the plate
-    int pin = getLEDPin(currentIngredient);
-    if (pin != -1) digitalWrite(pin, HIGH);
+  int pin = getLEDPin(currentIngredient);
+
+  if (pin != -1) {
+    digitalWrite(pin, HIGH);
     delay(2000);
-    if (pin != -1) digitalWrite(pin, LOW);
+    digitalWrite(pin, LOW);
+  }
 }

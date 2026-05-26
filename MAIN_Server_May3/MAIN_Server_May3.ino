@@ -1,634 +1,415 @@
 /*************************************************************
- MAIN_Server_Final_Updated_With_RoleAssignment_On_GameStart.ino
+  Let Em Cook - Server Code Refactored
 
- This sketch serves as the main "server" for an ESP-NOW-based
- escape room game, with the following responsibilities:
-
-   • Handling round-based game logic (Round 1, 2, 3).
-   • Managing RFID data (adding/removing plates).
-   • Receiving data from client stations (chop, cook, etc.).
-   • Tracking and updating player score.
-   • Connecting to Raspberry Pi's AP for scoreboard updates
-     (start_game, end_game, score/time updates) via HTTP POST.
-   • Sending role assignments & controlling the flow of each round.
-
- It uses:
-   – Arduino core for ESP32
-   – ESP-NOW for wireless communication with stations
-   – HTTPClient for scoreboard POST requests
-   – MFRC522 library for RFID
-   – DYPlayerArduino for audio feedback
-   – etc.
-
+  Architecture:
+  - Uses LetEmCookShared
+  - Uses LecPacket packetType protocol
+  - No legacy requestType strings
+  - No garbage station
+  - No oven/bake station
+  - 4 generic clients + 1 ingredient station
+  - Round 1: Chop, Chop, Mix, Serve
+  - Round 2: Chop, Cook, Mix, Serve
+  - Ingredient station owns overwriting/resetting plate ingredient
+  - Raspberry Pi display remains separate through HTTP
 *************************************************************/
+
+#define LEC_DEBUG 0
+
+#include <LetEmCook.h>
 
 #include <esp_now.h>
 #include <WiFi.h>
-#include <map>
-#include <string>
 #include <MFRC522.h>
 #include <SPI.h>
 #include <DYPlayerArduino.h>
-#include <HTTPClient.h> // Needed for HTTP POST to Pi
-#include <ArduinoOTA.h>  // Added OTA support
+#include <HTTPClient.h>
+
+extern "C" {
+  #include "esp_wifi.h"
+}
 
 /*************************************************************
- *  ADD THESE LINES **ONCE**, right after your last #include
- *  (before any code that calls Serial).
- *************************************************************/
-
-//#define DEBUG   // <-- uncomment when you DO want Serial output
-
-class NullSerial {
-public:
-  template<typename... Args> void begin(Args...)   {}
-  template<typename... Args> void print(Args...)   {}
-  template<typename... Args> void println(Args...) {}
-  template<typename... Args> void printf(const char*, ...) {}
-
-  int available() {
-    return 0;
-  }
-
-  String readStringUntil(char terminator) {
-    return "";
-  }
-};
-
-/*************************************************************
-    WIFI CREDENTIALS (to connect to Pi's AP)
+  WIFI / SCOREBOARD CONFIG
 *************************************************************/
-const char* scoreboardSSID = "MyScoreboardAP";     // Adjust to match your Pi's AP SSID
-const char* scoreboardPassword = "MySecretPassword"; // Adjust to match your Pi's AP password
 
-// Flag to track if we're connected to Pi's AP
+const char* scoreboardSSID = "MyScoreboardAP";
+const char* scoreboardPassword = "MySecretPassword";
+
+const char* SCOREBOARD_START_URL  = "http://10.42.0.1:5000/start_game";
+const char* SCOREBOARD_END_URL    = "http://10.42.0.1:5000/end_game";
+const char* SCOREBOARD_UPDATE_URL = "http://10.42.0.1:5000/update_score";
+
 bool connectedToScoreboard = false;
 
 /*************************************************************
-    GAME CONFIGURATIONS AND LIMITS
+  ASYNC PI SCOREBOARD QUEUE
 *************************************************************/
-// Maximum number of RFID "plates"
-#define MAX_PLATES 10
 
-// Maximum lengths for fixed-size strings
-#define RFID_LENGTH 20
-#define INGREDIENT_LENGTH 30
-#define REQUEST_TYPE_LENGTH 25
-#define MAX_RECIPE_NAME_LENGTH 30
+enum PiJobType : uint8_t {
+  PI_JOB_START,
+  PI_JOB_UPDATE,
+  PI_JOB_END
+};
 
-// Sentinel for invalid chop/cook counts
-#define INVALID_COUNT -1
+struct PiJob {
+  PiJobType type;
 
-// Long press duration (for adding/removing RFID)
-#define LONG_PRESS_DURATION 3000 // 3 seconds
+  int score;
+  int timeLeftSec;
 
-// Debounce delay (for button presses)
-#define DEBOUNCE_DELAY 30 // 30 ms
+  unsigned long durationSec;
+  int finalScore;
 
-// Max chop/cook
-#define MAX_CHOP_COUNT 5
-#define MAX_COOK_COUNT 10
+  char reason[80];
+  char currentRecipe[MAX_RECIPE_NAME_LENGTH];
+  char nextRecipe[MAX_RECIPE_NAME_LENGTH];
+};
 
-/*************************************************************
-    STAR LOGIC CONFIGURATION
-*************************************************************/
-// For example, 1 star if score >=2, 2 stars if >=5, 3 stars if >=7
-int starThresholds[3] = {2, 4, 6};
-int starMaxScore = 6;
+QueueHandle_t piQueue = nullptr;
+TaskHandle_t piTaskHandle = nullptr;
 
-// Helper to build "2,5,7"
-String getStarThresholdString() {
-  return String(starThresholds[0]) + "," + String(starThresholds[1]) + "," + String(starThresholds[2]);
-}
+unsigned long lastPiUpdateQueuedAt = 0;
+const unsigned long PI_UPDATE_QUEUE_INTERVAL_MS = 750;
+const uint16_t PI_HTTP_TIMEOUT_MS = 500;
 
 
 /*************************************************************
-    STRUCTS AND ENUMS
+  ASYNC INCOMING ESP-NOW PACKET QUEUE
 *************************************************************/
-// The message structure used for ESP-NOW
-typedef struct struct_message {
-  char rfid[RFID_LENGTH];                 // RFID tag ID
-  char ingredient[INGREDIENT_LENGTH];     // Ingredient name
-  int chopCount;                          // Chop count
-  int cookCount;                          // Cook count
-  int playerScoreDelta;                   // Score changes
-  bool reset;                             // Reset flag
-  char requestType[REQUEST_TYPE_LENGTH];  // e.g. "DataRequest"
-  int role;                               // ClientRole
-  char recipeName[MAX_RECIPE_NAME_LENGTH];// For recipes
-} struct_message;
 
-// Enum for client roles
-enum ClientRole {
-  ROLE_NONE = 0,
-  ROLE_GARBAGE = 1,
-  ROLE_CHOP_STATION = 2,
-  ROLE_COOK_STATION = 3,
-  ROLE_MIX_STATION = 4,
-  ROLE_ORDER_SERVE_STATION = 5,
-  ROLE_INGREDIENT_STATION = 6,
-  ROLE_OVEN_STATION = 7
+struct IncomingPacketJob {
+  uint8_t mac[6];
+  LecPacket packet;
 };
 
-// For request types
-enum RequestType {
-  DATA_REQUEST,
-  DATA_UPDATE,
-  ROLE_REQUEST,
-  CURRENT_RECIPE_REQUEST,
-  CURRENT_RECIPE_RESPONSE,
-  SELECT_NEW_RECIPE,
-  REINITIALIZE,
-  NEW_RECIPE,
-  ROLE_ASSIGNMENT,
-  BURNT,
-  ON_FIRE,
-  EXTINGUISH_FIRE,
-
-  UNKNOWN_REQUEST
-};
+QueueHandle_t incomingPacketQueue = nullptr;
 
 /*************************************************************
-    NEW ROUND LOGIC – State, Timers, Goals
+  PIN DEFINITIONS
 *************************************************************/
-// Round states
-enum RoundState {
-  ROUND_NONE = 0,  // no active round
-  ROUND_1,
-  ROUND_2,
-  ROUND_3,
-  ROUND_DONE
-};
 
-RoundState currentRound = ROUND_NONE;
-
-// For each round, we track how many correct serves have occurred
-int correctServesInRound = 0;
-
-// how many dishes must be served to finish each round
-const int serveTargets[] = {
-  0,  // ROUND_NONE (unused)
-  2,  // ROUND_1: need 2 serves
-  2,  // ROUND_2: need 2 serves
-  99  // ROUND_3: potential for bonus round
-};
-
-// Instead of a single gameRunning, we use it to indicate if *any* round is active
-bool gameRunning = false;
-
-// Add near your other globals:
-bool fifteenSecondWarningPlayed = false;
-
-// We'll keep track of the time each round started + how long it should last
-unsigned long roundStartTime = 0;
-unsigned long roundDuration = 0;
-
-// round transitions
-bool   pendingRoundTransition = false;
-int    nextRoundNumber        = 0;
-unsigned long transitionRequestTime = 0;
-const unsigned long TRANSITION_DELAY = 2000;  // wait 2 s for video
-
-// non-blocking “finish start round” helpers
-bool     roundStartPending     = false;
-unsigned long roundStartQueuedAt = 0;
-const unsigned long ROLE_ASSIGN_DELAY_MS = 4800;
-
-// ── place near the other “pending/queued” flags ──
-bool     fireRecipePending      = false;
-unsigned long fireRecipeQueuedAt = 0;
-
-// ── one‑shot re‑broadcast of NewRecipe ─────────────────────
-bool           recipeRebroadcastPending = false;
-unsigned long  recipeRebroadcastAt      = 0;   // millis target
-// ───────────────────────────────────────────────────────────
-
-// — delayed broadcast after a correct serve —
-bool           serveSuccessRecipePending = false;
-unsigned long  serveSuccessRecipeAt      = 0;
-const unsigned long SUCCESS_DELAY_MS     = 2500;   // 2.5 s
-
-/*************************************************************
-    PIN DEFINITIONS
-*************************************************************/
-// RFID reader pins
 #define SS_PIN 21
 #define RST_PIN 22
 
-// Buttons (assume active LOW)
 #define GREEN_BUTTON_PIN 13
 #define RED_BUTTON_PIN   4
 #define FIRE_BUTTON_PIN  35
 
-// Button LEDs
 #define GREEN_BUTTON_LED_PIN 27
 #define RED_BUTTON_LED_PIN   26
 #define FIRE_LED_PIN         25
 
-// Audio module pins (DY-HV20T)
-#define AUDIO_TX 16 // TX2
-#define AUDIO_RX 17 // RX2
-
-// Sprite media player pins
-#define SPRITE_TX 32 // TX1
-#define SPRITE_RX 33 // RX1
+#define AUDIO_TX 16
+#define AUDIO_RX 17
 
 /*************************************************************
-    GLOBAL HARDWARE INSTANCES
+  HARDWARE
 *************************************************************/
-// RFID reader
+
 MFRC522 rfid(SS_PIN, RST_PIN);
 
-// Audio module
 HardwareSerial audioSerial(2);
 DY::Player audioModule(&audioSerial);
 
-// Sprite media player
-HardwareSerial spriteSerial(1);
+/*************************************************************
+  SERVER CONFIG
+*************************************************************/
+
+#define SERVER_MAX_NODES 12
+#define ROUND_TRANSITION_DELAY_MS 2500
+#define ROLE_RECIPE_DELAY_MS 2000
+
+#define ROUND_1_DURATION_MS 120000UL
+#define ROUND_2_DURATION_MS 120000UL
+
+const int starThresholds[3] = {2, 4, 6};
+const int starMaxScore = 6;
+
+#define ROUND_1_COUNTDOWN_DELAY_MS 6500UL
+
+#define ROLE_ASSIGNMENT_SEND_COUNT 3
+#define ROLE_ASSIGNMENT_RETRY_INTERVAL_MS 700UL
+#define SERVER_ROLE_TRANSITION_DELAY_MS 4700UL
+
+int roleAssignmentSendsRemaining = 0;
+
+bool pendingRoleAssignmentBroadcast = false;
+unsigned long roleAssignmentBroadcastAt = 0;
 
 /*************************************************************
-    GAME VARIABLES
+  NODE ROSTER
 *************************************************************/
-// This array holds all RFID data for "plates"
-struct_message rfidDataArray[MAX_PLATES];
-int rfidDataCount = 0; // how many in use
 
-// The player score
-int playerScore = 0;
+struct ServerNode {
+  bool used;
+  bool online;
 
-// the players star score
-int starScore = 0;
+  uint8_t mac[6];
 
-// For concurrency control
+  LecDeviceClass deviceClass;
+  LecRole assignedRole;
+  LecRunMode runMode;
+
+  char claimedId[LEC_CLAIMED_ID_LENGTH];
+  char firmwareVersion[LEC_FW_VERSION_LENGTH];
+  char status[LEC_STATUS_LENGTH];
+
+  unsigned long lastSeenMs;
+  uint32_t lastSequence;
+};
+
+ServerNode nodes[SERVER_MAX_NODES];
+
+/*************************************************************
+  PLATES
+*************************************************************/
+
+LecPlateState plates[MAX_PLATES];
+int plateCount = 0;
+
+/*************************************************************
+  GAME STATE
+*************************************************************/
+
 SemaphoreHandle_t xMutex;
 
-// Maps from MAC -> assigned role
-std::map<std::string, ClientRole> clientRoles;
-std::map<std::string, ClientRole> macToRoleMap = {
-  {"C4:DE:E2:5B:81:58", ROLE_NONE},        // Server
-  {"08:A6:F7:B1:67:88", ROLE_INGREDIENT_STATION},        // Ingredient
-  {"D0:EF:76:31:63:F8", ROLE_NONE},
-  {"D0:EF:76:33:59:74", ROLE_NONE},
-  {"D0:EF:76:30:58:EC", ROLE_NONE},
-  {"D0:EF:76:34:04:1C", ROLE_NONE},
-  {"08:A6:F7:B1:16:20", ROLE_NONE},
-  {"C4:DE:E2:9C:8E:94", ROLE_NONE}
-};
+bool gameRunning = false;
+bool onFire = false;
+
+LecRound currentRound = LEC_ROUND_NONE;
+
+int playerScore = 0;
+int correctServesInRound = 0;
+
+unsigned long roundStartTime = 0;
+unsigned long roundDuration = 0;
+
+bool fifteenSecondWarningPlayed = false;
+
+LecRecipe currentRecipe;
+LecRecipe nextRecipe;
+bool currentRecipeValid = false;
+bool nextRecipeValid = false;
+
+bool pendingRoundTransition = false;
+LecRound pendingNextRound = LEC_ROUND_NONE;
+unsigned long roundTransitionAt = 0;
+
+bool pendingRecipeBroadcast = false;
+unsigned long recipeBroadcastAt = 0;
 
 /*************************************************************
-    RECIPE DATA
+  BUTTON STATE
 *************************************************************/
-// Each ingredient requirement in a recipe
-struct IngredientRequirement {
-  char name[INGREDIENT_LENGTH];
-  bool requiresChop;
-  int requiredChopCount;
-  bool requiresCook;
-  int requiredCookCountMin;
-  int requiredCookCountMax;
-};
 
-// A recipe is a collection of IngredientRequirements
-#define MAX_RECIPE_INGREDIENTS 3
-
-struct Recipe {
-  char name[MAX_RECIPE_NAME_LENGTH];
-  int numIngredients;
-  IngredientRequirement ingredients[MAX_RECIPE_INGREDIENTS];
-  bool bakeable; 
-  int requiredBakeCountMin;
-  int requiredBakeCountMax;
-};
-
-// Our recipes
-Recipe recipes[] = {
-    {
-        "garden salad",
-        2,
-        {
-            {"lettuce", true, MAX_CHOP_COUNT, false, 0, 0},
-            {"tomato", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "apple salad",
-        2,
-        {
-            {"apple", true, MAX_CHOP_COUNT, false, 0, 0},
-            {"lettuce", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "tomatoes and cheese",
-        2,
-        {
-            {"tomato", true, MAX_CHOP_COUNT, false, 0, 0},
-            {"cheese", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "apples and cheese",
-        2,
-        {
-            {"apple", true, MAX_CHOP_COUNT, false, 0, 0},
-            {"cheese", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "cheese salad",
-        2,
-        {
-            {"lettuce", true, MAX_CHOP_COUNT, false, 0, 0},
-            {"cheese", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "tomato pasta with cheese",
-        3,
-        {
-            {"tomato", false, 0, true, 7, 9},
-            {"dough", false, 0, true, 7, 9},
-            {"cheese", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "taco with cheese",
-        3,
-        {
-            {"meat", false, 0, true, 7, 9},
-            {"dough", false, 0, true, 7, 9},
-            {"cheese", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "taco with lettuce",
-        3,
-        {
-            {"meat", false, 0, true, 7, 9},
-            {"dough", false, 0, true, 7, 9},
-            {"lettuce", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "taco with tomato",
-        3,
-        {
-            {"meat", false, 0, true, 7, 9},
-            {"dough", false, 0, true, 7, 9},
-            {"tomato", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "beef stew with cheese",
-        3,
-        {
-            {"meat", false, 0, true, 7, 9},
-            {"tomato", false, 0, true, 7, 9},
-            {"cheese", true, MAX_CHOP_COUNT, false, 0, 0}
-        },
-        false, 0, 0
-    },
-    {
-        "beef patty",
-        2,
-        {
-            {"meat", false, MAX_CHOP_COUNT, true, 7, 9},
-            {"dough", true, MAX_CHOP_COUNT, false, 0, 0},
-        },
-        true, 4, 4
-    },
-    {
-        "tomato pizza",
-        2,
-        {
-            {"tomato", false, MAX_CHOP_COUNT, true, 7, 9},
-            {"dough", true, MAX_CHOP_COUNT, false, 0, 0},
-        },
-        true, 4, 4
-    },
-    {
-        "baked mac and cheese",
-        2,
-        {
-            {"dough", false, MAX_CHOP_COUNT, true, 7, 9},
-            {"cheese", true, MAX_CHOP_COUNT, false, 0, 0},
-        },
-        true, 4, 4
-    },
-    {
-        "apple pie",
-        2,
-        {
-            {"apple", false, MAX_CHOP_COUNT, true, 7, 9},
-            {"dough", true, MAX_CHOP_COUNT, false, 0, 0},
-        },
-        true, 4, 4
-    }
-};
-
-const int totalRecipes = sizeof(recipes) / sizeof(recipes[0]);
-
-// We'll store a pointer or index for the "current recipe" in each round
-Recipe currentRecipe;
-
-// holds the recipe we’ll use immediately after currentRecipe
-Recipe nextRecipe;
-
-/*************************************************************
-    BUTTON STATE VARIABLES
-*************************************************************/
-// For green button
 unsigned long greenButtonPressStartTime = 0;
 bool greenButtonLongPressHandled = false;
 
-// For red button
 unsigned long redButtonPressStartTime = 0;
 bool redButtonLongPressHandled = false;
 
-// for fire button
 unsigned long fireButtonPressStartTime = 0;
 
-/*************************************************************
-    DEFERRED SCORE UPDATE TO PI
-*************************************************************/
-volatile bool scoreUpdatePending = false;
-int pendingScore = 0;
-int pendingTimeLeft = 0;
-
-/*************************************************************
-    NEW FIRE LOGIC - PIN DEFINITIONS & GLOBALS
-*************************************************************/
-bool onFire = false;
-unsigned long lastFireButtonBlinkTime = 0;
+unsigned long lastFireBlinkTime = 0;
 bool fireLedState = LOW;
 
 /*************************************************************
-    FUNCTION PROTOTYPES
+  FUNCTION PROTOTYPES
 *************************************************************/
+
+void connectToScoreboardWithTimeout();
 void initializeHardware();
+void initializeEspNow();
+
+void initializeAsyncQueues();
+
+void processIncomingPackets();
+
+void startPiScoreboardTask();
+void piScoreboardTask(void* parameter);
+
+void queuePiStartGame(unsigned long durationSec);
+void queuePiEndGame(const String& reason, int finalScore);
+void queuePiUpdate(int score, int timeLeftSec);
+
+void performPiStartGame(const PiJob& job);
+void performPiEndGame(const PiJob& job);
+void performPiUpdate(const PiJob& job);
+
+void handleSerialCommands();
+void handleButtons();
+void handleGreenButton();
+void handleRedButton();
+void handleFireButton();
+
+void startGame();
+void startRound(LecRound round);
+void endCurrentRound();
+void endGame(const String& reason);
+void resetGameState();
+
+void assignRolesForCurrentRound();
+void sendRoleAssignmentToNode(ServerNode& node);
+void broadcastStartRound(LecRound round);
+void broadcastEndGame();
+void broadcastReinitialize();
+void broadcastFireState(bool fireActive);
+void broadcastCurrentRecipe();
+void sendRecipeToNode(ServerNode& node);
+void scheduleRoleAssignmentBroadcast(unsigned long delayMs);
+
+void pickRecipeForRound(LecRound round, LecRecipe& outRecipe, bool& valid);
+bool isRecipeAllowedForRound(const LecRecipe& recipe, LecRound round);
+int getServeTargetForRound(LecRound round);
+
+void processRoundTransition();
+void processPendingRoleAssignmentBroadcast();
+void broadcastRoleAssignments();
+void processPendingRecipeBroadcast();
+void processCountdownAndScoreboard();
+
+void handleIncomingPacket(const uint8_t* mac, const LecPacket& packet);
+void handleHelloPacket(const uint8_t* mac, const LecPacket& packet);
+void handlePlateLookup(const uint8_t* mac, const LecPacket& packet);
+void handlePlateUpdate(const uint8_t* mac, const LecPacket& packet);
+void handleRecipeRequest(const uint8_t* mac, const LecPacket& packet);
+void handleServeAttempt(const uint8_t* mac, const LecPacket& packet);
+void handleFireRequest(const uint8_t* mac, const LecPacket& packet);
+void handleDebugLog(const uint8_t* mac, const LecPacket& packet);
+
+void sendPacketToMac(const uint8_t* mac, LecPacket& packet);
+void sendPlateStateToMac(const uint8_t* mac, const LecPlateState& plate, LecPacketResult result);
+void sendAckToMac(const uint8_t* mac, LecPacketType type, LecPacketResult result, const char* status);
+
+int findNodeByMac(const uint8_t* mac);
+int upsertNode(const uint8_t* mac, const LecPacket& packet);
+bool addPeerIfNeeded(const uint8_t* mac);
+int countGenericClients();
+void collectGenericClientIndexes(int* indexes, int& count);
+void shuffleIndexes(int* indexes, int count);
+
+int findPlateIndex(const char* rfid);
+int findOrCreatePlate(const char* rfid);
+void initializePlates();
+void resetAllPlates();
+
 bool readRFID(char* rfidUID);
-void blinkButtonLED(int ledPin);
-int findRFIDIndex(const char* rfid);
-bool addRFIDData(const struct_message* data);
-bool addRFID(const char* rfidUID);
-bool removeRFIDFromArray(const char* rfidUID);
-void sendDataBackToClient(const uint8_t* mac_addr, struct_message* message);
-String macToString(const uint8_t* mac_addr);
-bool stringToMAC(const std::string& macStr, uint8_t* macBytes);
-RequestType getRequestType(const char* requestTypeStr);
-void sendNewRecipeToRelevantStations(bool scheduleRepeat = true);
-void initializeRFIDData();
-void reinitializeRFIDData();
-void sendReinitializeToAllClients();
-void sendRoleAssignmentToAllClients();
-void addAllPeers();
+bool PICC_IsAnyCardPresent();
+void resetRFIDReader();
+
 int getTimeLeftInSeconds();
 void notifyPiStartGame(unsigned long durationSec);
-void notifyPiEndGame(String reason, int finalScore);
-void updateScoreAndTimeOnPi(int newScore, int timeLeftSec);
+void notifyPiEndGame(const String& reason, int finalScore);
+void updateScoreAndTimeOnPi(int score, int timeLeftSec);
+String getStarThresholdString();
 
-// NEW round logic
-void startRound1();
-void startRound2();
-void startRound3();
-void endCurrentRound();
+void blinkButtonLED(int ledPin);
 
-// Role assignment for each round
-void assignRolesForRound1();
-void assignRolesForRound2();
-void assignRolesForRound3();
+void pickDifferentRecipeForRound(
+  LecRound round,
+  const char* avoidRecipeName,
+  LecRecipe& outRecipe,
+  bool& valid
+);
 
-// Random recipe picks
-void pickRandomRecipeForRound1();
-void pickRandomRecipeForRound2();
-void pickRandomRecipeForRound3();
-void pickNextRecipeForRound1();
-void pickNextRecipeForRound2();
-void pickNextRecipeForRound3();
+void printOperatorHelp();
 
-// serial commands
-void handleSerialCommands();
+void handleMaintenanceResultPacket(const uint8_t* mac, const LecPacket& packet);
+
+void sendMaintenancePacketToNode(
+  ServerNode& node,
+  LecPacketType packetType,
+  const char* status,
+  const char* payload
+);
+
+void broadcastMaintenancePacket(
+  LecPacketType packetType,
+  const char* status,
+  const char* payload,
+  LecDeviceClass deviceClassFilter = LEC_DEVICE_UNKNOWN
+);
+
+ServerNode* findNodeByClaimedId(const char* claimedId);
+
+void sendMaintenancePacketToTarget(
+  const char* target,
+  LecPacketType packetType,
+  const char* status,
+  const char* payload
+);
+
+String getArgToken(const String& text, int index);
+void handleNetSetCommand(const String& rawCommand);
+void handleNetPushCommand(const String& rawCommand);
+void handleUpdateCommand(const String& rawCommand);
+void handleMaintCommand(const String& rawCommand);
+void handleRebootCommand(const String& rawCommand);
 
 /*************************************************************
-    SETUP FUNCTION
+  ESP-NOW CALLBACKS
 *************************************************************/
-void setup() {
-  // Start serial
-  Serial.begin(115200);
 
-  /*************************************************
-   * Quick scan for debugging (optional)
-   *************************************************/
-  Serial.println("Scanning for WiFi networks...");
-  int n = WiFi.scanNetworks();
-  Serial.println("Scan done.");
+void onDataSent(const wifi_tx_info_t* tx_info, esp_now_send_status_t status) {
+#if LEC_DEBUG
+  Serial.print("Send status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAILED");
+#endif
+}
 
-  if (n == 0) {
-    Serial.println("No networks found");
-  } else {
-    for (int i = 0; i < n; i++) {
-      Serial.print(i + 1);
-      Serial.print(": ");
-      Serial.print(WiFi.SSID(i));
-      Serial.print(" (");
-      Serial.print(WiFi.RSSI(i));
-      Serial.print(") ");
-
-      if (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) {
-        Serial.println("Open");
-      } else {
-        Serial.println("Encrypted");
-      }
-
-      delay(10);
-    }
+void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* incomingData, int len) {
+  if (len != sizeof(LecPacket)) {
+#if LEC_DEBUG
+    Serial.println("Received packet size mismatch.");
+#endif
+    return;
   }
 
-  /*************************************************
-   * Configure WiFi
-   ********************************F*****************/
+  if (incomingPacketQueue == nullptr) {
+    return;
+  }
+
+  IncomingPacketJob job;
+  memcpy(job.mac, info->src_addr, 6);
+  memcpy(&job.packet, incomingData, sizeof(LecPacket));
+
+  BaseType_t result = xQueueSend(incomingPacketQueue, &job, 0);
+
+#if LEC_DEBUG
+  if (result != pdTRUE) {
+    Serial.println("Incoming packet queue full. Packet dropped.");
+  }
+#endif
+}
+
+/*************************************************************
+  SETUP
+*************************************************************/
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println();
+  Serial.println("Booting Let Em Cook Server...");
+
   WiFi.mode(WIFI_STA);
   delay(100);
 
-  Serial.println();
   Serial.print("Server MAC Address: ");
   Serial.println(WiFi.macAddress());
 
-  /*************************************************
-   * Connect to Pi's AP
-   *************************************************/
-  Serial.println("\nConnecting to scoreboard AP...");
+  connectToScoreboardWithTimeout();
 
-  // Optional: pass channel (6) if you know Pi AP is on 6
-  WiFi.begin(scoreboardSSID, scoreboardPassword, 6);
+  initializeAsyncQueues();
+  startPiScoreboardTask();
 
-  unsigned long wifiStartTime = millis();
-  const unsigned long wifiTimeout = 10000; // 10 seconds
+  SPI.begin();
+  rfid.PCD_Init();
 
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - wifiStartTime < wifiTimeout) {
+  esp_wifi_set_channel(LEC_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
-    delay(500);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nConnected to scoreboard AP!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-
-    connectedToScoreboard = true;
-  } else {
-    Serial.println("\nScoreboard AP not found. Continuing without scoreboard.");
-    connectedToScoreboard = false;
-  }
-
-  /*************************************************
-   * Initialize OTA
-   *************************************************/
-  ArduinoOTA.onStart([]() {
-    Serial.println("OTA Update Start");
-  });
-
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nOTA Update End");
-  });
-
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    Serial.printf("OTA Progress: %u%%\n",
-                  (progress / (total / 100)));
-  });
-
-  ArduinoOTA.onError([](ota_error_t error) {
-    Serial.printf("OTA Error[%u]: ", error);
-
-    if (error == OTA_AUTH_ERROR)
-      Serial.println("Auth Failed");
-    else if (error == OTA_BEGIN_ERROR)
-      Serial.println("Begin Failed");
-    else if (error == OTA_CONNECT_ERROR)
-      Serial.println("Connect Failed");
-    else if (error == OTA_RECEIVE_ERROR)
-      Serial.println("Receive Failed");
-    else if (error == OTA_END_ERROR)
-      Serial.println("End Failed");
-  });
-
-  ArduinoOTA.begin();
-  Serial.println("OTA Initialized");
-
-  /*************************************************
-   * Initialize mutex
-   *************************************************/
   xMutex = xSemaphoreCreateMutex();
 
   if (xMutex == NULL) {
@@ -636,1361 +417,1792 @@ void setup() {
     return;
   }
 
-  /*************************************************
-   * Initialize ESP-NOW
-   *************************************************/
+  initializeHardware();
+  initializeEspNow();
+  initializePlates();
+
+  currentRound = LEC_ROUND_NONE;
+
+  Serial.println("Server setup complete.");
+  Serial.println("Serial commands: start, end, reset, list, roles, recipe, fire, ext");
+}
+
+/*************************************************************
+  LOOP
+*************************************************************/
+
+void loop() {
+  processIncomingPackets();
+
+  handleSerialCommands();
+  handleButtons();
+
+  processRoundTransition();
+
+  processPendingRoleAssignmentBroadcast();
+
+  processPendingRecipeBroadcast();
+  processCountdownAndScoreboard();
+
+  if (gameRunning && roundDuration > 0) {
+    if (millis() - roundStartTime >= roundDuration) {
+      endCurrentRound();
+    }
+  }
+
+  delay(5);
+}
+
+/*************************************************************
+  INIT
+*************************************************************/
+
+void connectToScoreboardWithTimeout() {
+  Serial.println("Connecting to scoreboard AP...");
+
+  WiFi.begin(scoreboardSSID, scoreboardPassword, LEC_ESPNOW_CHANNEL);
+
+  unsigned long start = millis();
+  const unsigned long timeout = 10000;
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    connectedToScoreboard = true;
+
+    Serial.println();
+    Serial.println("Connected to scoreboard AP.");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("WiFi Channel: ");
+    Serial.println(WiFi.channel());
+
+    if (WiFi.channel() != LEC_ESPNOW_CHANNEL) {
+      Serial.println("WARNING: Scoreboard AP channel does not match LEC_ESPNOW_CHANNEL.");
+      Serial.println("ESP-NOW clients may not communicate correctly.");
+    }
+  } else {
+    connectedToScoreboard = false;
+
+    Serial.println();
+    Serial.println("Scoreboard AP unavailable. Continuing with ESP-NOW only.");
+
+    WiFi.disconnect(false);
+    WiFi.mode(WIFI_STA);
+    delay(100);
+    esp_wifi_set_channel(LEC_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  }
+}
+
+void initializeHardware() {
+  pinMode(GREEN_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(RED_BUTTON_PIN, INPUT_PULLUP);
+
+  // GPIO35 is input-only and has no internal pullup/pulldown.
+  // Use external resistor wiring for this button.
+  pinMode(FIRE_BUTTON_PIN, INPUT);
+
+  pinMode(GREEN_BUTTON_LED_PIN, OUTPUT);
+  pinMode(RED_BUTTON_LED_PIN, OUTPUT);
+  pinMode(FIRE_LED_PIN, OUTPUT);
+
+  digitalWrite(GREEN_BUTTON_LED_PIN, LOW);
+  digitalWrite(RED_BUTTON_LED_PIN, LOW);
+  digitalWrite(FIRE_LED_PIN, LOW);
+
+  audioSerial.begin(9600, SERIAL_8N1, AUDIO_RX, AUDIO_TX);
+  audioModule.begin();
+  audioModule.setCycleMode(DY::PlayMode::OneOff);
+  audioModule.setVolume(24);
+  audioModule.stop();
+
+  Serial.println("Hardware initialized.");
+}
+
+void initializeEspNow() {
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP-NOW");
+    Serial.println("Error initializing ESP-NOW.");
     return;
   }
 
-  // Register receive callback
+  esp_now_register_send_cb(onDataSent);
   esp_now_register_recv_cb(onDataRecv);
 
-  // Add peers
-  addAllPeers();
+  Serial.println("ESP-NOW initialized.");
+}
 
-  // Initialize hardware
-  initializeHardware();
+void initializeAsyncQueues() {
+  incomingPacketQueue = xQueueCreate(20, sizeof(IncomingPacketJob));
 
-  // Initialize RFID data to default
-  initializeRFIDData();
+  if (incomingPacketQueue == nullptr) {
+    Serial.println("Failed to create incoming ESP-NOW packet queue.");
+  } else {
+    Serial.println("Incoming ESP-NOW packet queue created.");
+  }
+}
 
-  // Set currentRound to none
-  currentRound = ROUND_NONE;
+void processIncomingPackets() {
+  if (incomingPacketQueue == nullptr) {
+    return;
+  }
 
-  Serial.println("Server setup complete.");
+  IncomingPacketJob job;
+
+  while (xQueueReceive(incomingPacketQueue, &job, 0) == pdTRUE) {
+    if (!addPeerIfNeeded(job.mac)) {
+#if LEC_DEBUG
+      Serial.println("Could not add sender as peer.");
+#endif
+      continue;
+    }
+
+    if (!lecIsValidPacket(job.packet, sizeof(LecPacket))) {
+#if LEC_DEBUG
+      Serial.println("Invalid Let Em Cook packet.");
+#endif
+      continue;
+    }
+
+#if LEC_DEBUG
+    if (job.packet.packetType != LEC_PKT_HELLO &&
+        job.packet.packetType != LEC_PKT_NODE_STATUS) {
+      Serial.println("=== Server Received Packet ===");
+      Serial.print("From: ");
+      Serial.println(lecMacToString(job.mac));
+      Serial.print("Packet Type: ");
+      Serial.println(static_cast<int>(job.packet.packetType));
+      Serial.print("Device Class: ");
+      Serial.println(static_cast<int>(job.packet.deviceClass));
+      Serial.print("Role: ");
+      Serial.println(static_cast<int>(job.packet.role));
+      Serial.print("RFID: ");
+      Serial.println(job.packet.rfid);
+      Serial.print("Ingredient: ");
+      Serial.println(job.packet.ingredient);
+      Serial.print("Recipe: ");
+      Serial.println(job.packet.recipeName);
+      Serial.println("==============================");
+    }
+#endif
+
+    handleIncomingPacket(job.mac, job.packet);
+  }
 }
 
 /*************************************************************
-    LOOP FUNCTION
-*************************************************************/
-void loop() {
-  // Handle OTA updates
-  ArduinoOTA.handle();
-
-  handleSerialCommands();
-
-  /*************************************************
-   * Handle GREEN BUTTON
-   *************************************************/
-  if (digitalRead(GREEN_BUTTON_PIN) == LOW) {
-    // Button pressed
-    if (greenButtonPressStartTime == 0) {
-      // Start of press
-      greenButtonPressStartTime = millis();
-      greenButtonLongPressHandled = false;
-    } else {
-      // Check how long
-      unsigned long pressDuration = millis() - greenButtonPressStartTime;
-      if (pressDuration >= LONG_PRESS_DURATION && !greenButtonLongPressHandled) {
-        // Long press detected => Add RFID
-        greenButtonLongPressHandled = true;
-        Serial.println("Long press detected on Green button. Adding RFID...");
-
-        char newRFID[RFID_LENGTH];
-        if (readRFID(newRFID)) {
-          Serial.print("Read RFID: ");
-          Serial.println(newRFID);
-          if (addRFID(newRFID)) {
-            blinkButtonLED(GREEN_BUTTON_LED_PIN);
-          } else {
-            blinkButtonLED(GREEN_BUTTON_LED_PIN);
-          }
-        } else {
-          Serial.println("Failed to read RFID during Green button long press.");
-          blinkButtonLED(GREEN_BUTTON_LED_PIN);
-        }
-      }
-    }
-  } else {
-    // Button released
-    if (greenButtonPressStartTime != 0) {
-      unsigned long pressDuration = millis() - greenButtonPressStartTime;
-      if (!greenButtonLongPressHandled && pressDuration < LONG_PRESS_DURATION) {
-        // Blink Button LED
-        blinkButtonLED(GREEN_BUTTON_LED_PIN);
-        // Short press => start Round 1 if not in a round
-        if (!gameRunning && currentRound == ROUND_NONE) {
-          startRound1();
-        } else {
-          // --- NEW LOGIC: If a round is active, pick new recipe:
-          if (gameRunning && currentRound != ROUND_NONE) {
-             Serial.println("Green button short press => selecting a NEW recipe for this round...");
-
-             // Acquire mutex if needed
-             if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
-                // Choose from correct subset:
-                switch (currentRound) {
-                  case ROUND_1:
-                    pickRandomRecipeForRound1();
-                    break;
-                  case ROUND_2:
-                    pickRandomRecipeForRound2();
-                    break;
-                  case ROUND_3:
-                    pickRandomRecipeForRound3();
-                    break;
-                  default:
-                    // or pick from all recipes if not strictly in a round
-                    // pickRandomRecipeFromAll();
-                    break;
-                }
-                // Now broadcast to relevant stations
-                sendNewRecipeToRelevantStations();
-
-                xSemaphoreGive(xMutex);
-             } else {
-                Serial.println("Failed to acquire mutex for new recipe selection.");
-             }
-         }
-         // else if (!gameRunning) { // Optionally do something else }
-
-      
-          // If we are in the middle of a round, let's do the old "select new recipe" approach?
-          // Or you can decide it does nothing if a round is running.
-          // For demonstration, let's keep old logic:
-          Serial.println("Short press on Green while round in progress => picked new recipe.");
-          // You could do something else here if you want.
-        }
-      }
-      // Reset
-      greenButtonPressStartTime = 0;
-      greenButtonLongPressHandled = false;
-    }
-  }
-
-  /*************************************************
-   * Handle RED BUTTON
-   *************************************************/
-  if (digitalRead(RED_BUTTON_PIN) == LOW) {
-    // Button pressed
-    if (redButtonPressStartTime == 0) {
-      redButtonPressStartTime = millis();
-      redButtonLongPressHandled = false;
-    } else {
-      unsigned long pressDuration = millis() - redButtonPressStartTime;
-      if (pressDuration >= LONG_PRESS_DURATION && !redButtonLongPressHandled) {
-        // Long press => remove RFID
-        redButtonLongPressHandled = true;
-        Serial.println("Long press detected on Red button. Removing RFID...");
-
-        char rfidToRemove[RFID_LENGTH];
-        if (readRFID(rfidToRemove)) {
-          Serial.print("Read RFID: ");
-          Serial.println(rfidToRemove);
-          if (removeRFIDFromArray(rfidToRemove)) {
-            blinkButtonLED(RED_BUTTON_LED_PIN);
-          } else {
-            blinkButtonLED(RED_BUTTON_LED_PIN);
-          }
-        } else {
-          Serial.println("Failed to read RFID during Red button long press.");
-          blinkButtonLED(RED_BUTTON_LED_PIN);
-        }
-      }
-    }
-  } else {
-    // Button released
-    if (redButtonPressStartTime != 0) {
-      unsigned long pressDuration = millis() - redButtonPressStartTime;
-      if (!redButtonLongPressHandled && pressDuration < LONG_PRESS_DURATION) {
-        // Short press => end round/game if a round is running
-        if (gameRunning) {
-          Serial.println("Short press on Red => forcibly ending the game in the middle of a round.");
-          endGame("Red Button Press");
-        } else {
-          Serial.println("Short press on Red, no round running => do nothing special.");
-          blinkButtonLED(RED_BUTTON_LED_PIN);
-        }
-      }
-      // Reset
-      redButtonPressStartTime = 0;
-      redButtonLongPressHandled = false;
-    }
-  }
-
-  /*************************************************
-   * Update score/timer
-   *************************************************/
-  static unsigned long lastCountdownUpdate = 0;
-  if (gameRunning) {
-      unsigned long now = millis();
-      if (now - lastCountdownUpdate >= 1000) {
-          lastCountdownUpdate = now;
-          int timeLeft = getTimeLeftInSeconds();
-          
-          // Here, call updateScoreAndTimeOnPi:
-          updateScoreAndTimeOnPi(playerScore, timeLeft);
-
-          //  ─── play track 2 at 15 seconds left ───
-          if (timeLeft == 15 && !fifteenSecondWarningPlayed) {
-            audioModule.stop();
-            audioModule.playSpecified(2);
-            fifteenSecondWarningPlayed = true;
-          }
-      }
-  }
-
-  // ── finish any pending startRound work ──
-  if (roundStartPending && millis() - roundStartQueuedAt >= ROLE_ASSIGN_DELAY_MS) {
-    roundStartPending = false;
-
-    // now it’s been 4.8 s since assignRoles()
-    // do exactly what you used to do at the end of startRoundX():
-
-    // 1) pick the first recipe
-    switch (currentRound) {
-      case ROUND_1:
-        pickRandomRecipeForRound1();
-        if (serveTargets[currentRound] > 1) pickNextRecipeForRound1();
-        gameRunning = true;
-        roundStartTime = millis();
-        notifyPiStartGame(roundDuration / 1000);
-        break;
-      case ROUND_2:
-        gameRunning = true;
-        break;
-      case ROUND_3:
-        gameRunning = true;
-        break;
-      default:
-        break;
-    }
-
-    // 2) send the NewRecipe out
-    sendNewRecipeToRelevantStations();
-
-    Serial.println("Finished startRound sequence after 4.8 s delay.");
-  }
-
-  // if a round transition is pending and its delay has elapsed…
-  if (pendingRoundTransition && (millis() - transitionRequestTime >= TRANSITION_DELAY)) {
-    pendingRoundTransition = false;
-    if (nextRoundNumber == 2) startRound2();
-    else if (nextRoundNumber == 3) startRound3();
-  }
-
-  // — first NewRecipe after a successful serve —
-  if (serveSuccessRecipePending && millis() >= serveSuccessRecipeAt) {
-      serveSuccessRecipePending = false;
-      sendNewRecipeToRelevantStations();   // goes out once
-  }
-
-  // ── timed re‑broadcast of NewRecipe ─────────────────────────
-  if (recipeRebroadcastPending && millis() >= recipeRebroadcastAt) {
-      recipeRebroadcastPending = false;
-      sendNewRecipeToRelevantStations(false);   // ← no further repeats
-  }
-
-  // ── after role‑change on fire extinguish ──
-  if (fireRecipePending && millis() - fireRecipeQueuedAt >= ROLE_ASSIGN_DELAY_MS) {
-      fireRecipePending = false;
-      sendNewRecipeToRelevantStations();   // pushes *currentRecipe*
-  }
-
-  /*************************************************
-   * Check round timer
-   *************************************************/
-  if (gameRunning && (millis() - roundStartTime >= roundDuration)) {
-    // Round time expired => check pass/fail
-    endCurrentRound();
-  }
-
-  /*************************************************
-   * Handle Deferred Score Update
-   *************************************************/
-  if (scoreUpdatePending) {
-    int localScore = pendingScore;
-    int localTimeLeft = pendingTimeLeft;
-    scoreUpdatePending = false;
-    updateScoreAndTimeOnPi(localScore, localTimeLeft);
-  }
-
-  /************************************************************
-  * NEW FIRE LOGIC - Handle Fire Button
-  ************************************************************/
-  if (onFire) {
-    // Blink the FIRE_LED_PIN
-    if (millis() - lastFireButtonBlinkTime >= 500) {
-      lastFireButtonBlinkTime = millis();
-      fireLedState = !fireLedState;
-      digitalWrite(FIRE_LED_PIN, fireLedState);
-    }
-
-    // Debounced short press to extinguish
-    if (digitalRead(FIRE_BUTTON_PIN) == LOW) {
-      if (fireButtonPressStartTime == 0) {
-        // Button press started
-        fireButtonPressStartTime = millis();
-      }
-    } else {
-      if (fireButtonPressStartTime != 0) {
-        unsigned long pressDuration = millis() - fireButtonPressStartTime;
-        if (pressDuration >= DEBOUNCE_DELAY) {
-          onFire = false;
-          digitalWrite(FIRE_LED_PIN, LOW);
-
-          // Broadcast "ExtinguishFire" to all
-          struct_message extMsg;
-          memset(&extMsg, 0, sizeof(extMsg));
-          strncpy(extMsg.requestType, "ExtinguishFire", REQUEST_TYPE_LENGTH - 1);
-
-          for (const auto& entry : macToRoleMap) {
-            uint8_t macBytes[6];
-            if (stringToMAC(entry.first, macBytes)) {
-              sendDataBackToClient(macBytes, &extMsg);
-            }
-          }
-          // Reinit RFID data
-          reinitializeRFIDData();
-
-          delay(2500);
-
-          // 1) Keep the SAME recipe but reshuffle roles
-          if      (currentRound == ROUND_1) assignRolesForRound1();
-          else if (currentRound == ROUND_2) assignRolesForRound2();
-          else if (currentRound == ROUND_3) assignRolesForRound3();
-
-          // 2) queue a delayed broadcast of whatever ‘currentRecipe’ already is
-          fireRecipePending   = true;
-          fireRecipeQueuedAt  = millis();
-          
-          Serial.println("Fire extinguished. All stations set to normal mode.");
-        }
-        fireButtonPressStartTime = 0;
-      }
-    }
-  }
-
-  delay(10); // small delay to prevent watchdog resets
-}
-
-/*************************************************************
-    NEW ROUND LOGIC IMPLEMENTATION
+  SERIAL / BUTTONS
 *************************************************************/
 
-// --------------------------- Round 1 ------------------------
-void startRound1() {
-  currentRound = ROUND_1;
-  correctServesInRound = 0;
-  playerScore = 0;
-  roundDuration = 120000UL;
-  roundStartTime = 0;
-  
-
-  updateScoreAndTimeOnPi(playerScore, roundDuration / 1000);
-
-  // Optional: Play "start round 1" audio on server
-  Serial.println("Starting Round 1 => playing audio track for Round 1...");
-  audioModule.stop();
-  audioModule.playSpecified(1); // track #10 as an example
-
-  // Broadcast "StartRound1" so clients can do a Round 1 video
-  struct_message msg;
-  memset(&msg, 0, sizeof(msg));
-  strncpy(msg.requestType, "StartRound1", REQUEST_TYPE_LENGTH - 1);
-  // Send to all
-  for (auto& entry : macToRoleMap) {
-    uint8_t macBytes[6];
-    if (stringToMAC(entry.first, macBytes)) {
-      sendDataBackToClient(macBytes, &msg);
-    }
-  }
-
-  // Wait 10s for them to show some animation
-  delay(6000);
-
-  // Now randomize role assignments (3 chop, 1 mix, 1 order, 1 garbage, 1 ingredient, 0 cook):
-  assignRolesForRound1();
-
-  roundStartPending    = true;
-  roundStartQueuedAt   = millis();
-}
-
-// handle serial commands
 void handleSerialCommands() {
   if (!Serial.available()) {
     return;
   }
 
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();
-  cmd.toLowerCase();
+  String rawCmd = Serial.readStringUntil('\n');
+  rawCmd.trim();
 
-  if (cmd == "start") {
-    if (!gameRunning && currentRound == ROUND_NONE) {
-      Serial.println("Serial command: START");
-      startRound1();
-    } else {
-      Serial.println("Game already running.");
-    }
+  if (rawCmd.length() == 0) {
+    return;
   }
-  else if (cmd == "end") {
-    if (gameRunning) {
-      Serial.println("Serial command: END");
-      endGame("Serial Command");
+
+  // CHANGED: Keep rawCmd untouched so SSID/password/URL case is preserved.
+  // Only use lowerCmd for command detection.
+  String lowerCmd = rawCmd;
+  lowerCmd.toLowerCase();
+
+  if (lowerCmd == "help") {
+    printOperatorHelp();
+
+  } else if (lowerCmd == "start") {
+    startGame();
+
+  } else if (lowerCmd == "end") {
+    endGame("Serial Command");
+
+  } else if (lowerCmd == "reset") {
+    resetGameState();
+    broadcastReinitialize();
+
+  } else if (lowerCmd == "list") {
+    Serial.println("=== Nodes ===");
+
+    for (int i = 0; i < SERVER_MAX_NODES; i++) {
+      if (!nodes[i].used) continue;
+
+      Serial.print(i);
+      Serial.print(" | ");
+      Serial.print(lecMacToString(nodes[i].mac));
+      Serial.print(" | claimed=");
+      Serial.print(nodes[i].claimedId);
+      Serial.print(" | class=");
+      Serial.print(static_cast<int>(nodes[i].deviceClass));
+      Serial.print(" | role=");
+      Serial.print(static_cast<int>(nodes[i].assignedRole));
+      Serial.print(" | mode=");
+      Serial.print(static_cast<int>(nodes[i].runMode));
+      Serial.print(" | fw=");
+      Serial.print(nodes[i].firmwareVersion);
+      Serial.print(" | status=");
+      Serial.print(nodes[i].status);
+      Serial.print(" | lastSeen=");
+      Serial.println(nodes[i].lastSeenMs);
     }
-  }
-  else if (cmd == "reset") {
-    Serial.println("Serial command: RESET");
 
-    gameRunning = false;
-    currentRound = ROUND_NONE;
+  } else if (lowerCmd == "roles") {
+    assignRolesForCurrentRound();
 
-    reinitializeRFIDData();
+    for (int i = 0; i < SERVER_MAX_NODES; i++) {
+      if (nodes[i].used) {
+        sendRoleAssignmentToNode(nodes[i]);
+      }
+    }
 
-    pendingRoundTransition = false;
-    roundStartPending = false;
-    fireRecipePending = false;
-    recipeRebroadcastPending = false;
-    serveSuccessRecipePending = false;
+  } else if (lowerCmd == "recipe") {
+    pickRecipeForRound(currentRound, currentRecipe, currentRecipeValid);
+    pickRecipeForRound(currentRound, nextRecipe, nextRecipeValid);
+    broadcastCurrentRecipe();
 
+  } else if (lowerCmd == "fire") {
+    onFire = true;
+    digitalWrite(FIRE_LED_PIN, HIGH);
+    broadcastFireState(true);
+
+  } else if (lowerCmd == "ext") {
     onFire = false;
     digitalWrite(FIRE_LED_PIN, LOW);
-  }
-}
 
-void assignRolesForRound1() {
-  // We have 8 clients in macToRoleMap (excluding server).
-  // Round 1: 3 chop, 0 cook, 1 mix, 1 order, 1 garbage, 1 ingredient, etc.
-  // This is just a demonstration; you can adapt how you shuffle them.
+    broadcastFireState(false);
 
-  // Collect MAC addresses (excluding server itself).
-  std::vector<std::string> macList;
-  for (auto& kv : macToRoleMap) {
-    // skip the server if it's in the map
-    if (kv.second == ROLE_NONE && kv.first == WiFi.macAddress().c_str()) {
-      continue;
-    }
-    // Also skip the fridge’s MAC so we don’t randomly reassign it
-    if (kv.first == "08:A6:F7:B1:67:88") {
-      // Force it to remain ingredient station
-      macToRoleMap[kv.first] = ROLE_INGREDIENT_STATION;
-      continue;
-    }
+    pendingRecipeBroadcast = false;
 
-    // Everyone else can be randomized
-    macList.push_back(kv.first);
-  }
+  } else if (lowerCmd.startsWith("net set ")) {
+    handleNetSetCommand(rawCmd);
 
-  // Shuffle
-  for (int i = macList.size() - 1; i > 0; i--) {
-    int j = random(0, i + 1);
-    std::swap(macList[i], macList[j]);
-  }
+  } else if (lowerCmd.startsWith("net push")) {
+    handleNetPushCommand(rawCmd);
 
-  // We'll assign in order:
-  // 0 -> ingredient
-  // 1 -> garbage
-  // Next 3 -> chop
-  // next -> mix
-  // next -> order
-  // remainder -> none (if any)
-  // (Adapt to however you want the distribution.)
+  } else if (lowerCmd.startsWith("update ")) {
+    handleUpdateCommand(rawCmd);
 
-  if (macList.size() < 7) {
-    // fallback if we don't have enough
-    Serial.println("Warning: Not enough stations to fully assign Round 1 roles!");
-  }
+  } else if (lowerCmd.startsWith("maint ")) {
+    handleMaintCommand(rawCmd);
 
-  int index = 0;
+  } else if (lowerCmd.startsWith("reboot ")) {
+    handleRebootCommand(rawCmd);
 
-  // 1 -> garbage
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_GARBAGE;
-    index++;
-  }
-  // next 3 -> chop
-  for (int c = 0; c < 3; c++) {
-    if (index < (int)macList.size()) {
-      macToRoleMap[macList[index]] = ROLE_CHOP_STATION;
-      index++;
-    }
-  }
-  // next -> mix
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_MIX_STATION;
-    index++;
-  }
-  // next -> order
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_ORDER_SERVE_STATION;
-    index++;
-  }
-  // remainder -> none
-  while (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_NONE;
-    index++;
-  }
-
-  // Now broadcast role assignments
-  sendRoleAssignmentToAllClients();
-}
-
-void pickRandomRecipeForRound1() {
-  // Round 1: recipes[0]..recipes[4]
-  static int lastIdx = -1;
-  int idx;
-  do {
-    idx = random(0, 5);     // 0..4
-  } while (idx == lastIdx);
-  lastIdx = idx;
-
-  currentRecipe = recipes[idx];
-  Serial.print("Round 1 => Chosen recipe: ");
-  Serial.println(currentRecipe.name);
-}
-
-void pickNextRecipeForRound1() {
-  // Round 1 next: recipes[0]..recipes[4]
-  static int lastNextIdx = -1;
-  int idx;
-  do {
-    idx = random(0, 5);
-  } while (
-    idx == lastNextIdx
-    || strncmp(recipes[idx].name, currentRecipe.name, MAX_RECIPE_NAME_LENGTH) == 0
-  );
-  lastNextIdx = idx;
-
-  nextRecipe = recipes[idx];
-  Serial.print("→ Queued next (Round 1): ");
-  Serial.println(nextRecipe.name);
-}
-
-// --------------------------- Round 2 ------------------------
-void startRound2() {
-  currentRound = ROUND_2;
-  correctServesInRound = 0;
-
-  // Reinit RFID data for the new round
-  //reinitializeRFIDData();
-  
-  // Now randomize station locations with 2 cook stations, 1 chop, etc.
-  assignRolesForRound2();
-
-  roundStartPending    = true;
-  roundStartQueuedAt   = millis();
-}
-
-void assignRolesForRound2() {
-  // Round 2 => 2 cook stations, 1 chop, 1 mix, 1 order, 1 garbage, 1 ingredient, etc.
-  std::vector<std::string> macList;
-  for (auto& kv : macToRoleMap) {
-    if (kv.first == WiFi.macAddress().c_str()) {
-      continue;
-    }
-    // Also skip the fridge’s MAC so we don’t randomly reassign it
-    if (kv.first == "08:A6:F7:B1:67:88") {
-      // Force it to remain ingredient station
-      macToRoleMap[kv.first] = ROLE_INGREDIENT_STATION;
-      continue;
-    }
-
-    // Everyone else can be randomized
-    macList.push_back(kv.first);
-  }
-  for (int i = macList.size() - 1; i > 0; i--) {
-    int j = random(0, i + 1);
-    std::swap(macList[i], macList[j]);
-  }
-
-  int index = 0;
-  // 1 -> garbage
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_GARBAGE;
-    index++;
-  }
-  // 2 cooks
-  for (int c = 0; c < 2; c++) {
-    if (index < (int)macList.size()) {
-      macToRoleMap[macList[index]] = ROLE_COOK_STATION;
-      index++;
-    }
-  }
-  // 1 chop
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_CHOP_STATION;
-    index++;
-  }
-  // 1 mix
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_MIX_STATION;
-    index++;
-  }
-  // 1 order
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_ORDER_SERVE_STATION;
-    index++;
-  }
-  // remainder -> none
-  while (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_NONE;
-    index++;
-  }
-
-  // Send role assignments
-  sendRoleAssignmentToAllClients();
-}
-
-void pickRandomRecipeForRound2() {
-  // Round 2: recipes[5]..recipes[9]
-  static int lastIdx = -1;
-  int idx;
-  do {
-    idx = random(5, 10);    // 5..9
-  } while (idx == lastIdx);
-  lastIdx = idx;
-
-  currentRecipe = recipes[idx];
-  Serial.print("Round 2 => Chosen recipe: ");
-  Serial.println(currentRecipe.name);
-}
-
-void pickNextRecipeForRound2() {
-  // Round 2 next: recipes[5]..recipes[9]
-  static int lastNextIdx = -1;
-  int idx;
-  do {
-    idx = random(5, 10);
-  } while (
-    idx == lastNextIdx
-    || strncmp(recipes[idx].name, currentRecipe.name, MAX_RECIPE_NAME_LENGTH) == 0
-  );
-  lastNextIdx = idx;
-
-  nextRecipe = recipes[idx];
-  Serial.print("→ Queued next (Round 2): ");
-  Serial.println(nextRecipe.name);
-}
-
-// --------------------------- Round 3 ------------------------
-void startRound3() {
-  currentRound = ROUND_3;
-  correctServesInRound = 0;
-
-  // Reinit plates
-  // reinitializeRFIDData();
-
-  // Round 3 => 1 oven station, 1 cook station, 1 chop, 1 garbage, 1 mix, 1 order, 1 ingredient
-  assignRolesForRound3();
-
-  roundStartPending    = true;
-  roundStartQueuedAt   = millis();
-}
-
-void assignRolesForRound3() {
-  // We'll just demonstrate 1 oven, 1 cook, 1 chop, 1 mix, 1 order, 1 garbage, 1 ingredient
-  std::vector<std::string> macList;
-  for (auto& kv : macToRoleMap) {
-    if (kv.first == WiFi.macAddress().c_str()) {
-      continue;
-    }
-    // Also skip the fridge’s MAC so we don’t randomly reassign it
-    if (kv.first == "08:A6:F7:B1:67:88") {
-      // Force it to remain ingredient station
-      macToRoleMap[kv.first] = ROLE_INGREDIENT_STATION;
-      continue;
-    }
-
-    // Everyone else can be randomized
-    macList.push_back(kv.first);
-  }
-  for (int i = macList.size() - 1; i > 0; i--) {
-    int j = random(0, i + 1);
-    std::swap(macList[i], macList[j]);
-  }
-
-  int index = 0;
-
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_OVEN_STATION; // The new oven station
-    index++;
-  }
-
-  // 2 cooks
-  for (int c = 0; c < 2; c++) {
-    if (index < (int)macList.size()) {
-      macToRoleMap[macList[index]] = ROLE_COOK_STATION;
-      index++;
-    }
-  }
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_CHOP_STATION;
-    index++;
-  }
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_MIX_STATION;
-    index++;
-  }
-  if (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_ORDER_SERVE_STATION;
-    index++;
-  }
-  // remainder -> none
-  while (index < (int)macList.size()) {
-    macToRoleMap[macList[index]] = ROLE_NONE;
-    index++;
-  }
-
-  sendRoleAssignmentToAllClients();
-}
-
-void pickRandomRecipeForRound3() {
-  // Round 3: recipes[10]..recipes[13]
-  static int lastIdx = -1;
-  int idx;
-  do {
-    idx = random(10, 14);   // 10..13
-  } while (idx == lastIdx);
-  lastIdx = idx;
-
-  currentRecipe = recipes[idx];
-  Serial.print("Round 3 => Chosen recipe: ");
-  Serial.println(currentRecipe.name);
-}
-
-void pickNextRecipeForRound3() {
-  // Round 3 next: recipes[10]..recipes[13]
-  static int lastNextIdx = -1;
-  int idx;
-  do {
-    idx = random(10, 14);
-  } while (
-    idx == lastNextIdx
-    || strncmp(recipes[idx].name, currentRecipe.name, MAX_RECIPE_NAME_LENGTH) == 0
-  );
-  lastNextIdx = idx;
-
-  nextRecipe = recipes[idx];
-  Serial.print("→ Queued next (Round 3): ");
-  Serial.println(nextRecipe.name);
-}
-
-// Called when a round's time runs out:
-void endCurrentRound() {
-  gameRunning = false; // Temporarily stop
-
-  switch (currentRound) {
-    case ROUND_1:
-      if (correctServesInRound >= serveTargets[currentRound]) {
-        // pass => move to round 2
-        Serial.println("Round 1 success => starting Round 2...");
-        startRound2();
-      } else {
-        // fail => end game with final score = 0
-        starScore = 0;
-        endGame("not enough appetizers served");
-      }
-      break;
-
-    case ROUND_2:
-      if (correctServesInRound >= serveTargets[currentRound]) {
-        // pass => move to round 3
-        Serial.println("Round 2 success => starting Round 3...");
-        startRound3();
-      } else {
-        // fail => end game with final score = 1
-        starScore = 1;
-        endGame("not enough entrees served");
-      }
-      break;
-
-    case ROUND_3:
-      // final awarding
-      if (correctServesInRound >= serveTargets[currentRound]) {
-        starScore = 3; // if success
-      } else {
-        starScore = 2; // if not enough
-      }
-      endGame("Round 3 complete");
-      break;
-
-    default:
-      Serial.println("No active round to end. Doing nothing...");
-      break;
-  }
-}
-
-/*************************************************************
-    ESP-NOW RECEIVE CALLBACK
-*************************************************************/
-void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* incomingData, int len) {
-  if (len != sizeof(struct_message)) {
-    Serial.println("Received data size mismatch!");
-    return;
-  }
-
-  // If peer not known, add it
-  if (!esp_now_is_peer_exist(info->src_addr)) {
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, info->src_addr, 6);
-    peerInfo.channel = 0;
-    peerInfo.encrypt = false;
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.println("Failed to add client as peer");
-      return;
-    }
-  }
-
-  // Copy data into a struct_message
-  struct_message incomingMessage;
-  memcpy(&incomingMessage, incomingData, sizeof(incomingMessage));
-
-  // Ensure strings are null-terminated
-  incomingMessage.rfid[RFID_LENGTH - 1] = '\0';
-  incomingMessage.ingredient[INGREDIENT_LENGTH - 1] = '\0';
-  incomingMessage.requestType[REQUEST_TYPE_LENGTH - 1] = '\0';
-  incomingMessage.recipeName[MAX_RECIPE_NAME_LENGTH - 1] = '\0';
-
-  // MAC as string
-  String macStr = macToString(info->src_addr);
-
-  // Print debug
-  Serial.println("=== Server Received Data ===");
-  Serial.print("From MAC: ");  Serial.println(macStr);
-  Serial.print("RFID: ");      Serial.println(incomingMessage.rfid);
-  Serial.print("Ingredient: ");Serial.println(incomingMessage.ingredient);
-  Serial.print("Chop Count: ");Serial.println(incomingMessage.chopCount);
-  Serial.print("Cook Count: ");Serial.println(incomingMessage.cookCount);
-  Serial.print("Score Delta: ");Serial.println(incomingMessage.playerScoreDelta);
-  Serial.print("Reset: ");     Serial.println(incomingMessage.reset ? "true" : "false");
-  Serial.print("Request: ");   Serial.println(incomingMessage.requestType);
-  Serial.print("Role: ");      Serial.println(incomingMessage.role);
-  Serial.print("Recipe: ");    Serial.println(incomingMessage.recipeName);
-  Serial.println("=============================");
-
-  // Parse request
-  RequestType reqType = getRequestType(incomingMessage.requestType);
-
-  // ROLE_REQUEST
-  if (reqType == ROLE_REQUEST) {
-    ClientRole assignedRole = ROLE_NONE;
-    auto it = macToRoleMap.find(macStr.c_str());
-    if (it != macToRoleMap.end()) {
-      assignedRole = it->second;
-    } else {
-      Serial.println("Client MAC not recognized, assigning ROLE_NONE");
-    }
-
-    // Store role
-    clientRoles[macStr.c_str()] = assignedRole;
-
-    // Send back RoleAssignment
-    struct_message roleMsg;
-    memset(&roleMsg, 0, sizeof(roleMsg));
-    strncpy(roleMsg.requestType, "RoleAssignment", REQUEST_TYPE_LENGTH - 1);
-    roleMsg.role = assignedRole;
-
-    sendDataBackToClient(info->src_addr, &roleMsg);
-
-    Serial.print("Assigned role ");
-    Serial.print(assignedRole);
-    Serial.print(" to MAC ");
-    Serial.println(macStr);
-    return;
-  }
-
-  // SELECT_NEW_RECIPE – now we pick from the round's valid subset
-  if (reqType == SELECT_NEW_RECIPE) {
-    Serial.println("Processing SelectNewRecipe on server...");
-
-    // only if we’re inside a round
-    if (!gameRunning || currentRound == ROUND_NONE) {
-      Serial.println("No active round—ignoring SelectNewRecipe.");
-      return;
-    }
-
-    // if we’ve already hit the serve target, just drop it
-    if (correctServesInRound >= serveTargets[currentRound]) {
-      Serial.println("Ignoring client SelectNewRecipe—round is ending.");
-      return;
-    }
-
-    // lock our recipe state
-    if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
-      // 1) promote the queued recipe to current
-      currentRecipe = nextRecipe;
-      Serial.print("Promoted next → current: ");
-      Serial.println(currentRecipe.name);
-
-    if (correctServesInRound < serveTargets[currentRound]-1) {
-      // still within this round
-      switch (currentRound) {
-        case ROUND_1: pickNextRecipeForRound1(); break;
-        case ROUND_2: pickNextRecipeForRound2(); break;
-        case ROUND_3: pickNextRecipeForRound3(); break;
-      }
-    } else {
-      // last serve of this round → prepare next round’s first recipe
-      switch (currentRound) {
-        case ROUND_1:
-          pickNextRecipeForRound2();
-          break;
-        case ROUND_2:
-          pickNextRecipeForRound3();
-          break;
-        default:
-          // Round 3 has no Round 4 → clear
-          memset(&nextRecipe, 0, sizeof(nextRecipe));
-          break;
-      }
-    }
-
-      // 3) broadcast the new “current” out to stations
-      sendNewRecipeToRelevantStations();
-
-      xSemaphoreGive(xMutex);
-    } else {
-      Serial.println("Failed to acquire mutex in SELECT_NEW_RECIPE.");
-    }
-
-    return;
-  }
-
-
-  // CURRENT_RECIPE_REQUEST
-  if (reqType == CURRENT_RECIPE_REQUEST) {
-    Serial.println("Processing CurrentRecipeRequest...");
-
-    struct_message recipeMsg;
-    memset(&recipeMsg, 0, sizeof(recipeMsg));
-    strncpy(recipeMsg.requestType, "CurrentRecipeResponse", REQUEST_TYPE_LENGTH - 1);
-    strncpy(recipeMsg.recipeName, currentRecipe.name, MAX_RECIPE_NAME_LENGTH - 1);
-
-    sendDataBackToClient(info->src_addr, &recipeMsg);
-    Serial.println("CurrentRecipeResponse sent.");
-    return;
-  }
-
-  // REINITIALIZE
-  if (reqType == REINITIALIZE) {
-    Serial.println("Received Reinitialize request from client (unexpected).");
-    // Typically only the server triggers that. We can ignore or handle.
-    return;
-  }
-
-  // --- NEW FIRE LOGIC: BURNT
-  if (reqType == BURNT) {
-    Serial.println("Received BURNT request from cooking station => onFire = true...");
-    if (!onFire) {
-      onFire = true;
-      struct_message fireMsg;
-      memset(&fireMsg, 0, sizeof(fireMsg));
-      strncpy(fireMsg.requestType, "OnFire", REQUEST_TYPE_LENGTH - 1);
-
-      for (const auto& entry : macToRoleMap) {
-        uint8_t macBytes[6];
-        if (stringToMAC(entry.first, macBytes)) {
-          sendDataBackToClient(macBytes, &fireMsg);
-        }
-      }
-      Serial.println("All stations set to OnFire mode. Waiting for Fire button press to extinguish.");
-    }
-    return;
-  }
-
-  // If the round isn't running, ignore normal DataRequests
-  if (!gameRunning) {
-    Serial.println("Game not running (no active round), ignoring data.");
-    return;
-  }
-
-  // Otherwise handle data request/update
-  if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
-    int rfidIndex = findRFIDIndex(incomingMessage.rfid);
-    if (rfidIndex == -1) {
-      Serial.print("Unknown RFID: ");
-      Serial.println(incomingMessage.rfid);
-      xSemaphoreGive(xMutex);
-      return;
-    }
-
-    struct_message* currentData = &rfidDataArray[rfidIndex];
-
-    switch (reqType) {
-      case DATA_REQUEST: {
-        Serial.println("Processing DataRequest...");
-        strncpy(currentData->requestType, "DataResponse", REQUEST_TYPE_LENGTH - 1);
-        sendDataBackToClient(info->src_addr, currentData);
-        break;
-      }
-
-      case DATA_UPDATE: {
-        Serial.println("Processing DataUpdate...");
-        // reset if requested
-        if (incomingMessage.reset) {
-          strncpy(currentData->ingredient, "none", INGREDIENT_LENGTH - 1);
-          currentData->chopCount = 0;
-          currentData->cookCount = 0;
-          currentData->reset = false;
-          Serial.println("Reset plate data.");
-        }
-
-        // update ingredient
-        if (strncmp(incomingMessage.ingredient, "", INGREDIENT_LENGTH) != 0) {
-          strncpy(currentData->ingredient, incomingMessage.ingredient, INGREDIENT_LENGTH - 1);
-          Serial.print("Updated ingredient to: ");
-          Serial.println(currentData->ingredient);
-        }
-
-        // update chopCount
-        if (incomingMessage.chopCount != INVALID_COUNT) {
-          currentData->chopCount = incomingMessage.chopCount;
-          Serial.print("Updated chop count to: ");
-          Serial.println(currentData->chopCount);
-        }
-
-        // update cookCount
-        if (incomingMessage.cookCount != INVALID_COUNT) {
-          currentData->cookCount = incomingMessage.cookCount;
-          Serial.print("Updated cook count to: ");
-          Serial.println(currentData->cookCount);
-        }
-
-        // update player score
-        // handle correct vs. wrong serves
-        if (incomingMessage.playerScoreDelta > 0) {
-          // ─── correct serve ───
-          playerScore += incomingMessage.playerScoreDelta;
-          correctServesInRound += incomingMessage.playerScoreDelta;
-
-          // add 15 seconds
-          roundDuration += 15000UL;
-          pendingScore    = playerScore;
-          pendingTimeLeft = getTimeLeftInSeconds();
-          scoreUpdatePending = true;
-
-          currentRecipe = nextRecipe; 
-
-          if (correctServesInRound < serveTargets[currentRound]-1) {
-            // still within this round
-            switch (currentRound) {
-              case ROUND_1: pickNextRecipeForRound1(); break;
-              case ROUND_2: pickNextRecipeForRound2(); break;
-              case ROUND_3: pickNextRecipeForRound3(); break;
-            }
-          } else {
-            // last serve of this round → prepare next round’s first recipe
-            switch (currentRound) {
-              case ROUND_1:
-                pickNextRecipeForRound2();
-                break;
-              case ROUND_2:
-                pickNextRecipeForRound3();
-                break;
-              default:
-                // Round 3 has no Round 4 → clear
-                memset(&nextRecipe, 0, sizeof(nextRecipe));
-                break;
-            }
-          }
-
-          // schedule the broadcast after the success animation finishes
-          serveSuccessRecipePending = true;
-          serveSuccessRecipeAt      = millis() + SUCCESS_DELAY_MS;
-
-          // schedule the next round rather than calling it right away
-          if (currentRound == ROUND_1 && correctServesInRound >= serveTargets[currentRound]) {
-            Serial.println("Round 1 complete → scheduling Round 2 in 2 s");
-            pendingRoundTransition = true;
-            nextRoundNumber        = 2;
-            transitionRequestTime  = millis();
-          }
-          else if (currentRound == ROUND_2 && correctServesInRound >= serveTargets[currentRound]) {
-            Serial.println("Round 2 complete → scheduling Round 3 in 2 s");
-            pendingRoundTransition = true;
-            nextRoundNumber        = 3;
-            transitionRequestTime  = millis();
-          }
-        }
-        else if (incomingMessage.playerScoreDelta == 0
-              && incomingMessage.role    == ROLE_ORDER_SERVE_STATION) {
-          // ─── wrong serve ───
-          // subtract 10 seconds (no underflow)
-          if (roundDuration > 10000UL) roundDuration -= 10000UL;
-          else                         roundDuration = 0;
-
-          // push the new time to the Pi
-          pendingScore    = playerScore;           // score unchanged
-          pendingTimeLeft = getTimeLeftInSeconds();
-          scoreUpdatePending = true;
-        }
-        // otherwise (zero-deltas from other stations) do nothing
-
-
-        strncpy(currentData->requestType, "DataResponse", REQUEST_TYPE_LENGTH - 1);
-        sendDataBackToClient(info->src_addr, currentData);
-        break;
-      }
-
-      default:
-        Serial.println("Unknown request type received.");
-        break;
-    }
-
-    xSemaphoreGive(xMutex);
   } else {
-    Serial.println("Failed to acquire mutex.");
+    Serial.println("Unknown command. Type: help");
   }
 }
 
+void handleButtons() {
+  handleGreenButton();
+  handleRedButton();
+  handleFireButton();
+}
+
+void handleGreenButton() {
+  if (digitalRead(GREEN_BUTTON_PIN) == LOW) {
+    if (greenButtonPressStartTime == 0) {
+      greenButtonPressStartTime = millis();
+      greenButtonLongPressHandled = false;
+    }
+  } else {
+    if (greenButtonPressStartTime != 0) {
+      unsigned long pressDuration = millis() - greenButtonPressStartTime;
+
+      if (!greenButtonLongPressHandled && pressDuration < LEC_LONG_PRESS_DURATION_MS) {
+        blinkButtonLED(GREEN_BUTTON_LED_PIN);
+
+        if (!gameRunning) {
+          startGame();
+        } else {
+          pickRecipeForRound(currentRound, currentRecipe, currentRecipeValid);
+          pickRecipeForRound(currentRound, nextRecipe, nextRecipeValid);
+          broadcastCurrentRecipe();
+        }
+      }
+
+      greenButtonPressStartTime = 0;
+      greenButtonLongPressHandled = false;
+    }
+  }
+}
+
+void handleRedButton() {
+  if (digitalRead(RED_BUTTON_PIN) == LOW) {
+    if (redButtonPressStartTime == 0) {
+      redButtonPressStartTime = millis();
+      redButtonLongPressHandled = false;
+    }
+  } else {
+    if (redButtonPressStartTime != 0) {
+      unsigned long pressDuration = millis() - redButtonPressStartTime;
+
+      if (!redButtonLongPressHandled && pressDuration < LEC_LONG_PRESS_DURATION_MS) {
+        blinkButtonLED(RED_BUTTON_LED_PIN);
+
+        if (gameRunning) {
+          endGame("Red Button Press");
+        }
+      }
+
+      redButtonPressStartTime = 0;
+      redButtonLongPressHandled = false;
+    }
+  }
+}
+
+void handleFireButton() {
+  if (!onFire) {
+    return;
+  }
+
+  if (millis() - lastFireBlinkTime >= 500) {
+    lastFireBlinkTime = millis();
+    fireLedState = !fireLedState;
+    digitalWrite(FIRE_LED_PIN, fireLedState);
+  }
+
+  if (digitalRead(FIRE_BUTTON_PIN) == LOW) {
+    if (fireButtonPressStartTime == 0) {
+      fireButtonPressStartTime = millis();
+    }
+  } else {
+    if (fireButtonPressStartTime != 0) {
+      unsigned long duration = millis() - fireButtonPressStartTime;
+
+      if (duration >= LEC_DEFAULT_DEBOUNCE_MS) {
+        Serial.println("Fire extinguished by button.");
+
+        onFire = false;
+        digitalWrite(FIRE_LED_PIN, LOW);
+
+        broadcastFireState(false);
+
+        // Client now handles returning to its role/recipe screen after 0x0B.
+        // Do not refresh recipe here or the serve station may replay its recipe screen twice.
+        pendingRecipeBroadcast = false;
+      }
+
+      fireButtonPressStartTime = 0;
+    }
+  }
+}
+
+void handleDebugLog(const uint8_t* mac, const LecPacket& packet) {
+#if LEC_DEBUG
+  Serial.println("=== CLIENT DEBUG LOG ===");
+  Serial.print("From: ");
+  Serial.println(lecMacToString(mac));
+  Serial.print("Role: ");
+  Serial.println(static_cast<int>(packet.role));
+  Serial.print("Round: ");
+  Serial.println(static_cast<int>(packet.round));
+  Serial.print("Status: ");
+  Serial.println(packet.status);
+  Serial.print("Payload: ");
+  Serial.println(packet.payload);
+  Serial.print("RFID: ");
+  Serial.println(packet.rfid);
+  Serial.print("Ingredient: ");
+  Serial.println(packet.ingredient);
+  Serial.print("Recipe: ");
+  Serial.println(packet.recipeName);
+  Serial.print("Chop: ");
+  Serial.println(packet.chopCount);
+  Serial.print("Cook: ");
+  Serial.println(packet.cookCount);
+  Serial.println("========================");
+#endif
+}
+
 /*************************************************************
-    END GAME
+  GAME FLOW
 *************************************************************/
-void endGame(String reason) {
-  // We'll treat this as the absolute end (fail or finish).
-  currentRound = ROUND_NONE;
-  gameRunning = false; // no active round
+
+void startGame() {
+  if (gameRunning) {
+    Serial.println("Game already running.");
+    return;
+  }
+
+  resetAllPlates();
+
+  playerScore = 0;
+  correctServesInRound = 0;
   fifteenSecondWarningPlayed = false;
-  // cancel any in-flight transitions
   pendingRoundTransition = false;
-  nextRoundNumber        = 0;
-  roundStartPending      = false;
-  roundStartTime = 0;
+  pendingRecipeBroadcast = false;
 
+  pendingRoleAssignmentBroadcast = false;
 
+  roleAssignmentSendsRemaining = 0;
+
+  startRound(LEC_ROUND_1);
+}
+
+void startRound(LecRound round) {
+  currentRound = round;
+  correctServesInRound = 0;
+  gameRunning = true;
+  onFire = false;
+  digitalWrite(FIRE_LED_PIN, LOW);
+
+  if (round == LEC_ROUND_1) {
+    roundDuration = ROUND_1_DURATION_MS;
+  } else if (round == LEC_ROUND_2) {
+    roundDuration = ROUND_2_DURATION_MS;
+  } else {
+    endGame("Invalid Round");
+    return;
+  }
+
+  roundStartTime = millis();
+
+  Serial.print("Starting round: ");
+  Serial.println(static_cast<int>(currentRound));
+
+  // Tell clients the round started.
+  // Round 1 clients play countdown 0x13 here.
+  // Round 2 clients wait for role assignment/tornado.
+  broadcastStartRound(currentRound);
+
+  assignRolesForCurrentRound();
+
+  pickRecipeForRound(currentRound, currentRecipe, currentRecipeValid);
+
+  // Make nextRecipe different from currentRecipe where possible.
+  pickDifferentRecipeForRound(
+    currentRound,
+    currentRecipeValid ? currentRecipe.name : "",
+    nextRecipe,
+    nextRecipeValid
+  );
+
+  if (currentRound == LEC_ROUND_1) {
+    // After countdown, send role assignments multiple times.
+    // This protects against one client missing the first role packet.
+    scheduleRoleAssignmentBroadcast(ROUND_1_COUNTDOWN_DELAY_MS);
+
+    pendingRecipeBroadcast = false;
+
+    notifyPiStartGame(roundDuration / 1000);
+  } else {
+    // Round 2 starts role assignment immediately,
+    // but still retries safely.
+    scheduleRoleAssignmentBroadcast(0);
+
+    pendingRecipeBroadcast = false;
+  }
+
+  updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
+
+  audioModule.stop();
+  audioModule.playSpecified(currentRound == LEC_ROUND_1 ? 1 : 2);
+}
+
+void endCurrentRound() {
+  Serial.print("Ending round: ");
+  Serial.println(static_cast<int>(currentRound));
+
+  if (correctServesInRound < getServeTargetForRound(currentRound)) {
+    if (currentRound == LEC_ROUND_1) {
+      endGame("not enough round 1 orders served");
+    } else if (currentRound == LEC_ROUND_2) {
+      endGame("not enough round 2 orders served");
+    }
+    return;
+  }
+
+  if (currentRound == LEC_ROUND_1) {
+    pendingRoundTransition = true;
+    pendingNextRound = LEC_ROUND_2;
+    roundTransitionAt = millis() + ROUND_TRANSITION_DELAY_MS;
+  } else {
+    endGame("Round 2 complete");
+  }
+}
+
+void endGame(const String& reason) {
   Serial.println("Game ended.");
   Serial.print("Reason: ");
   Serial.println(reason);
-  Serial.print("Player score: ");
+  Serial.print("Final score: ");
   Serial.println(playerScore);
 
-  // Exit onFire mode if active
+  gameRunning = false;
+  currentRound = LEC_ROUND_NONE;
+  correctServesInRound = 0;
+  fifteenSecondWarningPlayed = false;
+  roleAssignmentSendsRemaining = 0;
+
+  pendingRoundTransition = false;
+  pendingRecipeBroadcast = false;
+
+  pendingRoleAssignmentBroadcast = false;
+
   if (onFire) {
     onFire = false;
     digitalWrite(FIRE_LED_PIN, LOW);
-
-    // Only send "ExtinguishFire" to the ingredient station(s)
-    struct_message extMsg;
-    memset(&extMsg, 0, sizeof(extMsg));
-    strncpy(extMsg.requestType, "ExtinguishFire", REQUEST_TYPE_LENGTH - 1);
-
-    for (const auto& entry : macToRoleMap) {
-      if (entry.second == ROLE_INGREDIENT_STATION) {
-        // Convert MAC string to bytes
-        uint8_t macBytes[6];
-        if (stringToMAC(entry.first, macBytes)) {
-          sendDataBackToClient(macBytes, &extMsg);
-        }
-      }
-    }
-    Serial.println("Exiting onFire mode.");
+    broadcastFireState(false);
   }
 
-  // Now send "endgame" to all stations EXCEPT the ingredient station
-  struct_message endgameMsg;
-  memset(&endgameMsg, 0, sizeof(endgameMsg));
-  strncpy(endgameMsg.requestType, "endgame", REQUEST_TYPE_LENGTH - 1);
-
-  for (const auto& entry : macToRoleMap) {
-    uint8_t macBytes[6];
-    if (stringToMAC(entry.first, macBytes)) {
-      sendDataBackToClient(macBytes, &endgameMsg);
-    }
-  }
-  
-  //stop music
-  audioModule.stop();
-
-  // Reinit RFID data
-  reinitializeRFIDData();
-
-  // Notify Pi
-  notifyPiEndGame(reason, playerScore);
-
-  // Provide feedback
-  if (reason == "Red Button Press") {
-    blinkButtonLED(RED_BUTTON_LED_PIN);
-  } else if (reason == "not enough appetizers served" || reason == "not enough entrees served") {
-    blinkButtonLED(RED_BUTTON_LED_PIN);
-  } else if (reason == "Round 3 complete") {
-    blinkButtonLED(GREEN_BUTTON_LED_PIN);
-  } else {
-    blinkButtonLED(GREEN_BUTTON_LED_PIN);
-  }
+  broadcastEndGame();
 
   audioModule.stop();
   audioModule.playSpecified(3);
 
-  // Wait 15 seconds so stations can finish playing the "endgame" video
-  delay(15000);
+  notifyPiEndGame(reason, playerScore);
 
-  // Send Reinitialize to clients
-  sendReinitializeToAllClients();
+  resetAllPlates();
+
+  delay(2000);
+  broadcastReinitialize();
+}
+
+void resetGameState() {
+  Serial.println("Resetting server game state.");
+
+  gameRunning = false;
+  onFire = false;
+  currentRound = LEC_ROUND_NONE;
+
+  playerScore = 0;
+  correctServesInRound = 0;
+
+  roundStartTime = 0;
+  roundDuration = 0;
+
+  roleAssignmentSendsRemaining = 0;
+
+  currentRecipeValid = false;
+  nextRecipeValid = false;
+
+  pendingRoundTransition = false;
+  pendingRecipeBroadcast = false;
+
+  pendingRoleAssignmentBroadcast = false;
+
+  digitalWrite(FIRE_LED_PIN, LOW);
+
+  resetAllPlates();
+
+  audioModule.stop();
 }
 
 /*************************************************************
-    PI NOTIFICATION FUNCTIONS
+  ROLE ASSIGNMENT
 *************************************************************/
-// Return time left in seconds in the current round
-int getTimeLeftInSeconds() {
-  if (!gameRunning) {
-    return 0;
-  }
-  unsigned long elapsed = millis() - roundStartTime;
-  if (elapsed >= roundDuration) {
-    return 0;
-  }
-  unsigned long remaining = roundDuration - elapsed;
-  return (int)(remaining / 1000);
-}
 
-// Notify Pi that game started
-// (We won't call this for each round. If you want, you can do it in startRound1())
-void notifyPiStartGame(unsigned long durationSec) {
-  if (!connectedToScoreboard) {
-    Serial.println("Not connected to scoreboard AP, cannot POST /start_game.");
-    return;
+void assignRolesForCurrentRound() {
+  int indexes[SERVER_MAX_NODES];
+  int count = 0;
+
+  collectGenericClientIndexes(indexes, count);
+  shuffleIndexes(indexes, count);
+
+  if (count < 4) {
+    Serial.print("Warning: expected 4 generic clients, found ");
+    Serial.println(count);
   }
 
-  // Build the star_threshold string => "2,5,7"
-  String thresholdsStr = getStarThresholdString();
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (!nodes[i].used) continue;
 
-  // Convert starMaxScore to a String
-  String maxScoreStr = String(starMaxScore);
-
-  HTTPClient http;
-  http.begin("http://10.42.0.1:5000/start_game");
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
-  // e.g. "duration=180&star_thresholds=2,5,7&max_score=7"
-  String postData = "duration=" + String(durationSec)
-                  + "&star_thresholds=" + thresholdsStr
-                  + "&max_score=" + maxScoreStr;
-
-  int httpCode = http.POST(postData);
-  http.end();
-
-  Serial.print("notifyPiStartGame => HTTP code: ");
-  Serial.println(httpCode);
-  Serial.println("POST data: " + postData);
-}
-
-// Notify Pi that game ended
-void notifyPiEndGame(String reason, int finalScore) {
-  if (!connectedToScoreboard) {
-    Serial.println("Not connected to scoreboard, cannot POST /end_game.");
-    return;
-  }
-
-  HTTPClient http;
-  http.begin("http://10.42.0.1:5000/end_game");
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
-  // e.g. "score=500&reason=TimerExpired"
-  String postData = "score=" + String(finalScore) + "&reason=" + reason;
-  int httpCode = http.POST(postData);
-  http.end();
-
-  Serial.print("notifyPiEndGame => HTTP code: ");
-  Serial.println(httpCode);
-}
-  
-// Send updated score/time to Pi
-void updateScoreAndTimeOnPi(int newScore, int timeLeftSec) {
-  if (!connectedToScoreboard) {
-    Serial.println("Not connected to scoreboard AP, cannot POST /update_score.");
-    return;
-  }
-
-  // Build the star_threshold string => "2,5,7"
-  String thresholdsStr = getStarThresholdString();
-  String maxScoreStr   = String(starMaxScore);
-
-  /* // Blank recipes during any transition (round‐end delay or round‐start delay)
-  bool inTransition = pendingRoundTransition || roundStartPending;
-  String currRec = inTransition
-                     ? ""
-                     : (strlen(currentRecipe.name) > 0
-                         ? String(currentRecipe.name)
-                         : "");
-  String nextRec = inTransition
-                     ? ""
-                     : (strlen(nextRecipe.name) > 0
-                         ? String(nextRecipe.name)
-                         : ""); */
-
-  String currRec = String(currentRecipe.name);
-  String nextRec = String(nextRecipe.name);
-
-  HTTPClient http;
-  http.begin("http://10.42.0.1:5000/update_score");
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-
-  /*
-    We now include:
-      score = newScore
-      time_left = timeLeftSec
-      star_thresholds = "2,5,7"
-      max_score = "7"
-  */
-  String postData = "score=" + String(newScore)
-                  + "&time_left=" + String(timeLeftSec)
-                  + "&star_thresholds=" + thresholdsStr
-                  + "&max_score=" + maxScoreStr
-                  + "&current_recipe=" + currRec
-                  + "&next_recipe="    + nextRec;
-
-  int httpResponseCode = http.POST(postData);
-  http.end();
-
-  Serial.print("Posted score/time => Score: ");
-  Serial.print(newScore);
-  Serial.print(", Time left: ");
-  Serial.print(timeLeftSec);
-  Serial.print(", HTTP code: ");
-  Serial.println(httpResponseCode);
-
-  Serial.println("POST data: " + postData);
-}
-
-/*************************************************************
-    RECIPE SELECTION + SENDING
-*************************************************************/
-void sendNewRecipeToRelevantStations(bool scheduleRepeat) {
-  // Send "NewRecipe" to stations that care (order/serve, mix, etc.)
-  Serial.println("Sending NewRecipe to relevant stations...");
-  for (const auto& entry : macToRoleMap) {
-    if (   entry.second == ROLE_ORDER_SERVE_STATION
-        || entry.second == ROLE_MIX_STATION
-        || entry.second == ROLE_COOK_STATION
-        || entry.second == ROLE_OVEN_STATION // if needed
-       ) 
-    {
-      uint8_t macBytes[6];
-      if (stringToMAC(entry.first, macBytes)) {
-        struct_message newRecipeMsg;
-        memset(&newRecipeMsg, 0, sizeof(newRecipeMsg));
-        strncpy(newRecipeMsg.requestType, "NewRecipe", REQUEST_TYPE_LENGTH - 1);
-        strncpy(newRecipeMsg.recipeName, currentRecipe.name, MAX_RECIPE_NAME_LENGTH - 1);
-
-        sendDataBackToClient(macBytes, &newRecipeMsg);
-        Serial.print("Sent NewRecipe to ");
-        Serial.println(entry.first.c_str());
-      } else {
-        Serial.print("Failed to convert MAC: ");
-        Serial.println(entry.first.c_str());
-      }
+    if (nodes[i].deviceClass == LEC_DEVICE_INGREDIENT_STATION) {
+      nodes[i].assignedRole = LEC_ROLE_INGREDIENT_STATION;
+    } else if (nodes[i].deviceClass == LEC_DEVICE_GENERIC_CLIENT) {
+      nodes[i].assignedRole = LEC_ROLE_NONE;
     }
   }
 
-  if (scheduleRepeat) {
-      recipeRebroadcastPending = true;
-      recipeRebroadcastAt      = millis() + 1000;
+  LecRole roundRoles[4];
+
+  if (currentRound == LEC_ROUND_1) {
+    roundRoles[0] = LEC_ROLE_CHOP_STATION;
+    roundRoles[1] = LEC_ROLE_CHOP_STATION;
+    roundRoles[2] = LEC_ROLE_MIX_STATION;
+    roundRoles[3] = LEC_ROLE_SERVE_STATION;
+  } else {
+    roundRoles[0] = LEC_ROLE_CHOP_STATION;
+    roundRoles[1] = LEC_ROLE_COOK_STATION;
+    roundRoles[2] = LEC_ROLE_MIX_STATION;
+    roundRoles[3] = LEC_ROLE_SERVE_STATION;
   }
 
-  Serial.println("Completed sending NewRecipe messages.");
+  for (int i = 0; i < count && i < 4; i++) {
+    nodes[indexes[i]].assignedRole = roundRoles[i];
+  }
+
+  Serial.println("Assigned roles for current round:");
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (!nodes[i].used) continue;
+
+    Serial.print(lecMacToString(nodes[i].mac));
+    Serial.print(" -> ");
+    Serial.println(static_cast<int>(nodes[i].assignedRole));
+  }
+}
+
+void sendRoleAssignmentToNode(ServerNode& node) {
+  if (!node.used) return;
+
+  LecPacket msg;
+  lecInitPacket(msg, LEC_PKT_ASSIGN_ROLE, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+  msg.role = node.assignedRole;
+  msg.round = currentRound;
+  lecSetStatus(msg, "role-assignment");
+
+  sendPacketToMac(node.mac, msg);
+}
+
+
+
+void broadcastRoleAssignments() {
+  // Centralized role assignment broadcast so startRound()
+  // and delayed Round 1 flow use the same logic.
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (nodes[i].used) {
+      sendRoleAssignmentToNode(nodes[i]);
+    }
+  }
+}
+
+void scheduleRoleAssignmentBroadcast(unsigned long delayMs) {
+  // Schedules multiple role assignment sends.
+  // This makes round-start more reliable if one ESP-NOW packet is missed.
+  pendingRoleAssignmentBroadcast = true;
+  roleAssignmentBroadcastAt = millis() + delayMs;
+  roleAssignmentSendsRemaining = ROLE_ASSIGNMENT_SEND_COUNT;
 }
 
 /*************************************************************
-    RFID DATA INITIALIZATION/REINIT
+  BROADCASTS
 *************************************************************/
-void initializeRFIDData() {
-  // Known RFID values for gameplay (6 plates)
-  const int initialRFIDCount = 6;
-  const char* knownRFIDs[initialRFIDCount] = {
+
+void broadcastStartRound(LecRound round) {
+  LecPacket msg;
+  lecInitPacket(msg, LEC_PKT_START_ROUND, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+  msg.round = round;
+  lecSetStatus(msg, "start-round");
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (nodes[i].used) {
+      sendPacketToMac(nodes[i].mac, msg);
+    }
+  }
+}
+
+void broadcastEndGame() {
+  LecPacket msg;
+  lecInitPacket(msg, LEC_PKT_END_GAME, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+  lecSetStatus(msg, "end-game");
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (nodes[i].used) {
+      sendPacketToMac(nodes[i].mac, msg);
+    }
+  }
+}
+
+void broadcastReinitialize() {
+  LecPacket msg;
+  lecInitPacket(msg, LEC_PKT_REINITIALIZE, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+  lecSetStatus(msg, "reinitialize");
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (nodes[i].used) {
+      sendPacketToMac(nodes[i].mac, msg);
+    }
+  }
+}
+
+void broadcastFireState(bool fireActive) {
+  LecPacket msg;
+  lecInitPacket(
+    msg,
+    fireActive ? LEC_PKT_ON_FIRE : LEC_PKT_EXTINGUISH_FIRE,
+    LEC_DEVICE_SERVER,
+    LEC_ROLE_SERVER
+  );
+
+  msg.success = true;
+  lecSetStatus(msg, fireActive ? "on-fire" : "fire-extinguished");
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (nodes[i].used) {
+      sendPacketToMac(nodes[i].mac, msg);
+    }
+  }
+}
+
+void broadcastCurrentRecipe() {
+  if (!currentRecipeValid) {
+    Serial.println("No current recipe to broadcast.");
+    return;
+  }
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (!nodes[i].used) continue;
+
+    if (nodes[i].assignedRole == LEC_ROLE_MIX_STATION ||
+        nodes[i].assignedRole == LEC_ROLE_SERVE_STATION ||
+        nodes[i].assignedRole == LEC_ROLE_COOK_STATION) {
+      sendRecipeToNode(nodes[i]);
+    }
+  }
+
+  //updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
+}
+
+void sendRecipeToNode(ServerNode& node) {
+  LecPacket msg;
+  lecInitPacket(msg, LEC_PKT_NEW_RECIPE, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+  msg.round = currentRound;
+  lecSetRecipeName(msg, currentRecipe.name);
+  lecSetStatus(msg, "new-recipe");
+
+  sendPacketToMac(node.mac, msg);
+}
+
+/*************************************************************
+  RECIPES
+*************************************************************/
+
+void pickDifferentRecipeForRound(
+  LecRound round,
+  const char* avoidRecipeName,
+  LecRecipe& outRecipe,
+  bool& valid
+) {
+  int allowed[LEC_TOTAL_RECIPES];
+  int count = 0;
+
+  for (int i = 0; i < LEC_TOTAL_RECIPES; i++) {
+    if (!isRecipeAllowedForRound(LEC_RECIPES[i], round)) {
+      continue;
+    }
+
+    // Prefer a recipe different from the current visible recipe.
+    if (avoidRecipeName != nullptr &&
+        avoidRecipeName[0] != '\0' &&
+        strcmp(LEC_RECIPES[i].name, avoidRecipeName) == 0) {
+      continue;
+    }
+
+    allowed[count++] = i;
+  }
+
+  // Fallback if there is only one valid recipe for this round.
+  if (count == 0) {
+    pickRecipeForRound(round, outRecipe, valid);
+    return;
+  }
+
+  int selected = allowed[random(0, count)];
+
+  outRecipe = LEC_RECIPES[selected];
+  valid = true;
+
+  Serial.print("Picked different recipe: ");
+  Serial.println(outRecipe.name);
+}
+
+void pickRecipeForRound(LecRound round, LecRecipe& outRecipe, bool& valid) {
+  int allowed[LEC_TOTAL_RECIPES];
+  int count = 0;
+
+  for (int i = 0; i < LEC_TOTAL_RECIPES; i++) {
+    if (isRecipeAllowedForRound(LEC_RECIPES[i], round)) {
+      allowed[count++] = i;
+    }
+  }
+
+  if (count == 0) {
+    valid = false;
+    memset(&outRecipe, 0, sizeof(outRecipe));
+    Serial.println("No valid recipes for round.");
+    return;
+  }
+
+  int selected = allowed[random(0, count)];
+
+  outRecipe = LEC_RECIPES[selected];
+  valid = true;
+
+  Serial.print("Picked recipe: ");
+  Serial.println(outRecipe.name);
+}
+
+bool isRecipeAllowedForRound(const LecRecipe& recipe, LecRound round) {
+  bool requiresCook = false;
+
+  for (int i = 0; i < recipe.numIngredients; i++) {
+    if (recipe.ingredients[i].requiresCook) {
+      requiresCook = true;
+      break;
+    }
+  }
+
+  if (round == LEC_ROUND_1) {
+    return !requiresCook;
+  }
+
+  if (round == LEC_ROUND_2) {
+    return requiresCook;
+  }
+
+  return false;
+}
+
+int getServeTargetForRound(LecRound round) {
+  if (round == LEC_ROUND_1) return LEC_ROUND_1_SERVE_TARGET;
+  if (round == LEC_ROUND_2) return LEC_ROUND_2_SERVE_TARGET;
+  return 0;
+}
+
+/*************************************************************
+  LOOP PROCESSORS
+*************************************************************/
+
+void processRoundTransition() {
+  if (!pendingRoundTransition) return;
+
+  if (millis() >= roundTransitionAt) {
+    LecRound next = pendingNextRound;
+
+    pendingRoundTransition = false;
+    pendingNextRound = LEC_ROUND_NONE;
+
+    startRound(next);
+  }
+}
+
+void processPendingRecipeBroadcast() {
+  if (!pendingRecipeBroadcast) return;
+
+  if (millis() >= recipeBroadcastAt) {
+    pendingRecipeBroadcast = false;
+    broadcastCurrentRecipe();
+  }
+}
+
+void processPendingRoleAssignmentBroadcast() {
+  if (!pendingRoleAssignmentBroadcast) return;
+
+  if (millis() >= roleAssignmentBroadcastAt) {
+    // Send role assignment, but keep retrying a couple times.
+    broadcastRoleAssignments();
+
+    roleAssignmentSendsRemaining--;
+
+    if (roleAssignmentSendsRemaining > 0) {
+      // Schedule another role assignment retry.
+      roleAssignmentBroadcastAt = millis() + ROLE_ASSIGNMENT_RETRY_INTERVAL_MS;
+      return;
+    }
+
+    // Finished all role assignment sends.
+    pendingRoleAssignmentBroadcast = false;
+
+    // Schedule recipe after clients have had time to finish tornado/role transition.
+    // This is safer than only waiting ROLE_RECIPE_DELAY_MS, because the client role delay is 4500ms.
+    pendingRecipeBroadcast = true;
+    recipeBroadcastAt = millis() + SERVER_ROLE_TRANSITION_DELAY_MS;
+  }
+}
+
+void processCountdownAndScoreboard() {
+  static unsigned long lastCountdownUpdate = 0;
+
+  if (!gameRunning) return;
+
+  if (millis() - lastCountdownUpdate >= 1000) {
+    lastCountdownUpdate = millis();
+
+    int timeLeft = getTimeLeftInSeconds();
+
+    updateScoreAndTimeOnPi(playerScore, timeLeft);
+
+    if (timeLeft == 15 && !fifteenSecondWarningPlayed) {
+      audioModule.stop();
+      audioModule.playSpecified(2);
+      fifteenSecondWarningPlayed = true;
+    }
+  }
+}
+
+/*************************************************************
+  INCOMING PACKETS
+*************************************************************/
+
+void handleIncomingPacket(const uint8_t* mac, const LecPacket& packet) {
+  upsertNode(mac, packet);
+
+  switch (packet.packetType) {
+    case LEC_PKT_HELLO:
+    case LEC_PKT_NODE_STATUS:
+      handleHelloPacket(mac, packet);
+      break;
+
+    case LEC_PKT_PLATE_LOOKUP:
+      handlePlateLookup(mac, packet);
+      break;
+
+    case LEC_PKT_PLATE_UPDATE:
+      handlePlateUpdate(mac, packet);
+      break;
+
+    case LEC_PKT_CURRENT_RECIPE_REQUEST:
+      handleRecipeRequest(mac, packet);
+      break;
+
+    case LEC_PKT_SERVE_ATTEMPT:
+      handleServeAttempt(mac, packet);
+      break;
+
+    case LEC_PKT_ON_FIRE:
+      handleFireRequest(mac, packet);
+      break;
+    
+    case LEC_PKT_MAINT_ACK:
+    case LEC_PKT_NET_CONFIG:
+    case LEC_PKT_BULK_UPDATE_RESULT:
+    case LEC_PKT_REBOOT_REQUEST:
+      handleMaintenanceResultPacket(mac, packet);
+      break;
+
+    case LEC_PKT_DEBUG_LOG:
+      handleDebugLog(mac, packet);
+      break;
+
+    default:
+      Serial.println("Unhandled packet type.");
+      break;
+  }
+}
+
+void handleMaintenanceResultPacket(const uint8_t* mac, const LecPacket& packet) {
+  int index = findNodeByMac(mac);
+
+  Serial.println("=== Maintenance Result ===");
+  Serial.print("From: ");
+  Serial.println(lecMacToString(mac));
+
+  if (index != -1) {
+    Serial.print("Claimed ID: ");
+    Serial.println(nodes[index].claimedId);
+  }
+
+  Serial.print("Packet Type: ");
+  Serial.println(static_cast<int>(packet.packetType));
+  Serial.print("Result: ");
+  Serial.println(static_cast<int>(packet.result));
+  Serial.print("Mode: ");
+  Serial.println(static_cast<int>(packet.runMode));
+  Serial.print("Status: ");
+  Serial.println(packet.status);
+  Serial.print("Payload: ");
+  Serial.println(packet.payload);
+  Serial.println("==========================");
+}
+
+void handleHelloPacket(const uint8_t* mac, const LecPacket& packet) {
+  int index = upsertNode(mac, packet);
+
+  if (index == -1) {
+    return;
+  }
+
+  if (nodes[index].deviceClass == LEC_DEVICE_INGREDIENT_STATION) {
+    nodes[index].assignedRole = LEC_ROLE_INGREDIENT_STATION;
+  }
+
+  LecPacket ack;
+  lecInitPacket(ack, LEC_PKT_CLAIM_ACK, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+  ack.result = LEC_RESULT_OK;
+  ack.round = currentRound;
+  lecSetStatus(ack, "hello-ack");
+
+  sendPacketToMac(mac, ack);
+
+  if (gameRunning) {
+    // Start-round should be sent before role assignment.
+    LecPacket startMsg;
+    lecInitPacket(startMsg, LEC_PKT_START_ROUND, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+    startMsg.round = currentRound;
+    lecSetStatus(startMsg, "start-round-sync");
+    sendPacketToMac(mac, startMsg);
+
+    // If Round 1 countdown is still pending, do not send role yet.
+    // The normal delayed broadcast will send it.
+    if (pendingRoleAssignmentBroadcast) {
+      Serial.println("HELLO during Round 1 countdown; sent start sync only.");
+      return;
+    }
+
+    // Now send role after start-round sync.
+    sendRoleAssignmentToNode(nodes[index]);
+
+    if (currentRecipeValid &&
+        (nodes[index].assignedRole == LEC_ROLE_MIX_STATION ||
+         nodes[index].assignedRole == LEC_ROLE_SERVE_STATION ||
+         nodes[index].assignedRole == LEC_ROLE_COOK_STATION)) {
+      sendRecipeToNode(nodes[index]);
+    }
+  }
+}
+
+void handlePlateLookup(const uint8_t* mac, const LecPacket& packet) {
+  if (packet.rfid[0] == '\0') {
+    sendAckToMac(mac, LEC_PKT_PLATE_STATE, LEC_RESULT_INVALID, "missing-rfid");
+    return;
+  }
+
+  if (!gameRunning) {
+    sendAckToMac(mac, LEC_PKT_PLATE_STATE, LEC_RESULT_BUSY, "game-not-running");
+    return;
+  }
+
+  if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+    int index = findOrCreatePlate(packet.rfid);
+
+    if (index == -1) {
+      xSemaphoreGive(xMutex);
+      sendAckToMac(mac, LEC_PKT_PLATE_STATE, LEC_RESULT_FAIL, "plate-store-full");
+      return;
+    }
+
+    LecPlateState plate = plates[index];
+
+    xSemaphoreGive(xMutex);
+
+    sendPlateStateToMac(mac, plate, LEC_RESULT_OK);
+  }
+}
+
+void handlePlateUpdate(const uint8_t* mac, const LecPacket& packet) {
+  if (packet.rfid[0] == '\0') {
+    sendAckToMac(mac, LEC_PKT_PLATE_STATE, LEC_RESULT_INVALID, "missing-rfid");
+    return;
+  }
+
+  if (!gameRunning) {
+    sendAckToMac(mac, LEC_PKT_PLATE_STATE, LEC_RESULT_BUSY, "game-not-running");
+    return;
+  }
+
+  if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+    int index = findOrCreatePlate(packet.rfid);
+
+    if (index == -1) {
+      xSemaphoreGive(xMutex);
+      sendAckToMac(mac, LEC_PKT_PLATE_STATE, LEC_RESULT_FAIL, "plate-store-full");
+      return;
+    }
+
+    LecPlateState& plate = plates[index];
+
+    if (packet.resetPlate) {
+      strncpy(plate.ingredient, "none", INGREDIENT_LENGTH - 1);
+      plate.ingredient[INGREDIENT_LENGTH - 1] = '\0';
+
+      plate.chopCount = 0;
+      plate.cookCount = 0;
+      plate.status = LEC_PLATE_ACTIVE;
+    }
+
+    if (packet.ingredient[0] != '\0') {
+      strncpy(plate.ingredient, packet.ingredient, INGREDIENT_LENGTH - 1);
+      plate.ingredient[INGREDIENT_LENGTH - 1] = '\0';
+      plate.status = LEC_PLATE_ACTIVE;
+    }
+
+    if (packet.chopCount != INVALID_COUNT) {
+      plate.chopCount = packet.chopCount;
+    }
+
+    if (packet.cookCount != INVALID_COUNT) {
+      plate.cookCount = packet.cookCount;
+    }
+
+    plate.updatedAtMs = millis();
+
+    LecPlateState responsePlate = plate;
+
+    xSemaphoreGive(xMutex);
+
+    sendPlateStateToMac(mac, responsePlate, LEC_RESULT_OK);
+  }
+}
+
+void handleRecipeRequest(const uint8_t* mac, const LecPacket& packet) {
+  if (!currentRecipeValid) {
+    sendAckToMac(mac, LEC_PKT_RECIPE_STATE, LEC_RESULT_FAIL, "no-current-recipe");
+    return;
+  }
+
+  LecPacket response;
+  lecInitPacket(response, LEC_PKT_RECIPE_STATE, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+  response.result = LEC_RESULT_OK;
+  response.round = currentRound;
+  lecSetRecipeName(response, currentRecipe.name);
+  lecSetStatus(response, "recipe-state");
+
+  sendPacketToMac(mac, response);
+}
+
+void handleServeAttempt(const uint8_t* mac, const LecPacket& packet) {
+  if (!gameRunning || !currentRecipeValid) {
+    sendAckToMac(mac, LEC_PKT_SERVE_RESULT, LEC_RESULT_BUSY, "game-not-ready");
+    return;
+  }
+
+  if (packet.rfid[0] == '\0') {
+    sendAckToMac(mac, LEC_PKT_SERVE_RESULT, LEC_RESULT_INVALID, "missing-rfid");
+    return;
+  }
+
+  bool success = false;
+
+  if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+    int index = findPlateIndex(packet.rfid);
+
+    if (index != -1) {
+      LecPlateState& plate = plates[index];
+
+      success = strcmp(plate.ingredient, currentRecipe.name) == 0;
+
+      if (success) {
+        Serial.println("Serve success.");
+
+        playerScore += 1;
+        correctServesInRound += 1;
+
+        roundDuration += 15000UL;
+
+        strncpy(plate.ingredient, "none", INGREDIENT_LENGTH - 1);
+        plate.ingredient[INGREDIENT_LENGTH - 1] = '\0';
+
+        plate.chopCount = 0;
+        plate.cookCount = 0;
+        plate.updatedAtMs = millis();
+      } else {
+        Serial.println("Serve failed.");
+
+        if (roundDuration > 10000UL) {
+          roundDuration -= 10000UL;
+        } else {
+          roundDuration = 0;
+        }
+      }
+    } else {
+      Serial.println("Serve failed: RFID not found.");
+      success = false;
+
+      if (roundDuration > 10000UL) {
+        roundDuration -= 10000UL;
+      } else {
+        roundDuration = 0;
+      }
+    }
+
+    xSemaphoreGive(xMutex);
+  }
+
+  LecPacket response;
+  lecInitPacket(response, LEC_PKT_SERVE_RESULT, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+
+  // Round complete can be Round 1 or Round 2.
+  bool roundComplete =
+    success && correctServesInRound >= getServeTargetForRound(currentRound);
+
+  // Game complete only happens when Round 2 is completed.
+  bool gameComplete =
+    roundComplete && currentRound == LEC_ROUND_2;
+
+  response.result = success ? LEC_RESULT_OK : LEC_RESULT_FAIL;
+  response.success = success;
+  response.playerScoreDelta = success ? 1 : 0;
+  response.round = currentRound;
+
+  // Only the final game-winning serve gets "serve-complete".
+  // Round 1 completion still behaves like normal serve success.
+  if (gameComplete) {
+    lecSetStatus(response, "serve-complete");
+  } else {
+    lecSetStatus(response, success ? "serve-success" : "serve-fail");
+  }
+
+  sendPacketToMac(mac, response);
+
+  updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
+
+  if (success) {
+    if (roundComplete) {
+      endCurrentRound();
+    } else {
+      currentRecipe = nextRecipe;
+      currentRecipeValid = nextRecipeValid;
+
+      pickDifferentRecipeForRound(
+        currentRound,
+        currentRecipeValid ? currentRecipe.name : "",
+        nextRecipe,
+        nextRecipeValid
+      );
+
+      pendingRecipeBroadcast = true;
+      recipeBroadcastAt = millis() + ROLE_RECIPE_DELAY_MS;
+    }
+  }
+}
+
+void handleFireRequest(const uint8_t* mac, const LecPacket& packet) {
+  if (onFire) return;
+
+  Serial.println("Fire triggered by client.");
+
+  onFire = true;
+  digitalWrite(FIRE_LED_PIN, HIGH);
+
+  broadcastFireState(true);
+}
+
+/*************************************************************
+  SEND HELPERS
+*************************************************************/
+
+void sendPacketToMac(const uint8_t* mac, LecPacket& packet) {
+  if (!mac) return;
+
+  packet.protocolVersion = LEC_PROTOCOL_VERSION;
+  packet.packetSize = sizeof(LecPacket);
+  packet.uptimeMs = millis();
+  packet.deviceClass = LEC_DEVICE_SERVER;
+
+  if (packet.packetType != LEC_PKT_MAINT_REQUEST &&
+      packet.packetType != LEC_PKT_MAINT_EXIT &&
+      packet.packetType != LEC_PKT_NET_CONFIG &&
+      packet.packetType != LEC_PKT_BULK_UPDATE_REQUEST &&
+      packet.packetType != LEC_PKT_REBOOT_REQUEST) {
+    packet.runMode = LEC_MODE_GAME;
+  }
+  
+  // For role assignment packets, packet.role is the ASSIGNED client role.
+  // Do not overwrite it with LEC_ROLE_SERVER.
+  if (packet.packetType != LEC_PKT_ASSIGN_ROLE) {
+    packet.role = LEC_ROLE_SERVER;
+  }
+
+  #if LEC_DEBUG
+    Serial.println("=== Sending Packet ===");
+    Serial.print("To: ");
+    Serial.println(lecMacToString(mac));
+    Serial.print("Type: ");
+    Serial.println(static_cast<int>(packet.packetType));
+    Serial.print("Role Field: ");
+    Serial.println(static_cast<int>(packet.role));
+    Serial.print("Result: ");
+    Serial.println(static_cast<int>(packet.result));
+    Serial.print("Recipe: ");
+    Serial.println(packet.recipeName);
+    Serial.println("======================");
+  #endif
+
+  esp_err_t result = esp_now_send(
+    mac,
+    reinterpret_cast<uint8_t*>(&packet),
+    sizeof(LecPacket)
+  );
+
+  if (result != ESP_OK) {
+    Serial.print("ESP-NOW send error: ");
+    Serial.println(result);
+  }
+}
+
+void sendPlateStateToMac(const uint8_t* mac, const LecPlateState& plate, LecPacketResult result) {
+  LecPacket response;
+  lecInitPacket(response, LEC_PKT_PLATE_STATE, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+
+  response.result = result;
+  response.round = currentRound;
+
+  lecSetRfid(response, plate.rfid);
+  lecSetIngredient(response, plate.ingredient);
+
+  response.chopCount = plate.chopCount;
+  response.cookCount = plate.cookCount;
+
+  lecSetStatus(response, result == LEC_RESULT_OK ? "plate-state" : "plate-error");
+
+  sendPacketToMac(mac, response);
+}
+
+void sendAckToMac(const uint8_t* mac, LecPacketType type, LecPacketResult result, const char* status) {
+  LecPacket response;
+  lecInitPacket(response, type, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+
+  response.result = result;
+  response.round = currentRound;
+  response.success = result == LEC_RESULT_OK;
+
+  lecSetStatus(response, status);
+
+  sendPacketToMac(mac, response);
+}
+
+void printOperatorHelp() {
+  Serial.println();
+  Serial.println("=== Let Em Cook Operator Console ===");
+  Serial.println("Gameplay:");
+  Serial.println("  start");
+  Serial.println("  end");
+  Serial.println("  reset");
+  Serial.println("  list");
+  Serial.println("  roles");
+  Serial.println("  recipe");
+  Serial.println("  fire");
+  Serial.println("  ext");
+  Serial.println();
+  Serial.println("Maintenance / OTA:");
+  Serial.println("  net set <ssid> <password> <baseUrl>");
+  Serial.println("  net push all");
+  Serial.println("  net push <claimedId>");
+  Serial.println("  maint all");
+  Serial.println("  maint <claimedId>");
+  Serial.println("  update all <binFile>");
+  Serial.println("  update generic <binFile>");
+  Serial.println("  update pantry <binFile>");
+  Serial.println("  update <claimedId> <binFile>");
+  Serial.println("  reboot all");
+  Serial.println("  reboot <claimedId>");
+  Serial.println();
+  Serial.println("Examples:");
+  Serial.println("  net set MyScoreboardAP MySecretPassword http://192.168.4.2:8080/LetEmCook");
+  Serial.println("  net push all");
+  Serial.println("  update generic generic-client.bin");
+  Serial.println("  update pantry ingredient-station.bin");
+  Serial.println("====================================");
+  Serial.println();
+}
+
+String getArgToken(const String& text, int index) {
+  int currentIndex = 0;
+  int tokenStart = -1;
+
+  for (int i = 0; i <= text.length(); i++) {
+    bool atEnd = i == text.length();
+    bool isSpace = !atEnd && isspace(text.charAt(i));
+
+    if (!atEnd && !isSpace && tokenStart == -1) {
+      tokenStart = i;
+    }
+
+    if ((atEnd || isSpace) && tokenStart != -1) {
+      if (currentIndex == index) {
+        return text.substring(tokenStart, i);
+      }
+
+      currentIndex++;
+      tokenStart = -1;
+    }
+  }
+
+  return "";
+}
+
+ServerNode* findNodeByClaimedId(const char* claimedId) {
+  if (claimedId == nullptr || claimedId[0] == '\0') {
+    return nullptr;
+  }
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (!nodes[i].used) continue;
+
+    if (strcmp(nodes[i].claimedId, claimedId) == 0) {
+      return &nodes[i];
+    }
+  }
+
+  return nullptr;
+}
+
+void sendMaintenancePacketToNode(
+  ServerNode& node,
+  LecPacketType packetType,
+  const char* status,
+  const char* payload
+) {
+  if (!node.used) {
+    return;
+  }
+
+  LecPacket msg;
+  lecInitPacket(msg, packetType, LEC_DEVICE_SERVER, LEC_ROLE_SERVER);
+
+  msg.round = currentRound;
+  msg.runMode = LEC_MODE_MAINT_REQUESTED;
+
+  if (status != nullptr) {
+    lecSetStatus(msg, status);
+  }
+
+  if (payload != nullptr) {
+    lecSetPayload(msg, payload);
+  }
+
+  sendPacketToMac(node.mac, msg);
+}
+
+void broadcastMaintenancePacket(
+  LecPacketType packetType,
+  const char* status,
+  const char* payload,
+  LecDeviceClass deviceClassFilter
+) {
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (!nodes[i].used) continue;
+
+    if (deviceClassFilter != LEC_DEVICE_UNKNOWN &&
+        nodes[i].deviceClass != deviceClassFilter) {
+      continue;
+    }
+
+    sendMaintenancePacketToNode(nodes[i], packetType, status, payload);
+  }
+}
+
+void sendMaintenancePacketToTarget(
+  const char* target,
+  LecPacketType packetType,
+  const char* status,
+  const char* payload
+) {
+  if (target == nullptr || target[0] == '\0') {
+    Serial.println("Missing target.");
+    return;
+  }
+
+  if (strcmp(target, "all") == 0) {
+    broadcastMaintenancePacket(packetType, status, payload);
+    return;
+  }
+
+  if (strcmp(target, "generic") == 0) {
+    broadcastMaintenancePacket(
+      packetType,
+      status,
+      payload,
+      LEC_DEVICE_GENERIC_CLIENT
+    );
+    return;
+  }
+
+  if (strcmp(target, "pantry") == 0 ||
+      strcmp(target, "ingredient") == 0 ||
+      strcmp(target, "ingredients") == 0) {
+    broadcastMaintenancePacket(
+      packetType,
+      status,
+      payload,
+      LEC_DEVICE_INGREDIENT_STATION
+    );
+    return;
+  }
+
+  ServerNode* node = findNodeByClaimedId(target);
+
+  if (node == nullptr) {
+    Serial.print("No node found with claimedId: ");
+    Serial.println(target);
+    return;
+  }
+
+  sendMaintenancePacketToNode(*node, packetType, status, payload);
+}
+
+void handleNetSetCommand(const String& rawCommand) {
+  String ssid = getArgToken(rawCommand, 2);
+  String password = getArgToken(rawCommand, 3);
+  String baseUrl = getArgToken(rawCommand, 4);
+
+  if (ssid.length() == 0 || baseUrl.length() == 0) {
+    Serial.println("Usage: net set <ssid> <password> <baseUrl>");
+    return;
+  }
+
+  bool saved = LecStorage::saveNetConfig(
+    ssid.c_str(),
+    password.c_str(),
+    baseUrl.c_str()
+  );
+
+  if (!saved) {
+    Serial.println("Failed to save server net config.");
+    return;
+  }
+
+  Serial.println("Server net config saved.");
+  Serial.print("SSID: ");
+  Serial.println(ssid);
+  Serial.print("OTA Base URL: ");
+  Serial.println(baseUrl);
+}
+
+void handleNetPushCommand(const String& rawCommand) {
+  String target = getArgToken(rawCommand, 2);
+
+  if (target.length() == 0) {
+    target = "all";
+  }
+
+  LecStorage::NetConfig config;
+
+  if (!LecStorage::loadNetConfig(config)) {
+    Serial.println("No server net config saved. Use:");
+    Serial.println("  net set <ssid> <password> <baseUrl>");
+    return;
+  }
+
+  String payload =
+    String(config.ssid) + "|" +
+    String(config.password) + "|" +
+    String(config.otaBaseUrl);
+
+  if (payload.length() >= LEC_PAYLOAD_LENGTH) {
+    Serial.println("Net config payload too long for ESP-NOW packet.");
+    return;
+  }
+
+  String targetLower = target;
+  targetLower.toLowerCase();
+
+  Serial.print("Pushing net config to: ");
+  Serial.println(targetLower);
+
+  sendMaintenancePacketToTarget(
+    targetLower.c_str(),
+    LEC_PKT_NET_CONFIG,
+    "net-config",
+    payload.c_str()
+  );
+}
+
+void handleMaintCommand(const String& rawCommand) {
+  String target = getArgToken(rawCommand, 1);
+
+  if (target.length() == 0) {
+    Serial.println("Usage: maint <all|generic|pantry|claimedId>");
+    return;
+  }
+
+  target.toLowerCase();
+
+  Serial.print("Sending maintenance request to: ");
+  Serial.println(target);
+
+  sendMaintenancePacketToTarget(
+    target.c_str(),
+    LEC_PKT_MAINT_REQUEST,
+    "maint-request",
+    nullptr
+  );
+}
+
+void handleUpdateCommand(const String& rawCommand) {
+  String target = getArgToken(rawCommand, 1);
+  String binFile = getArgToken(rawCommand, 2);
+
+  if (target.length() == 0 || binFile.length() == 0) {
+    Serial.println("Usage: update <all|generic|pantry|claimedId> <binFile>");
+    return;
+  }
+
+  if (binFile.length() >= LEC_PAYLOAD_LENGTH) {
+    Serial.println("Bin filename/path too long for payload.");
+    return;
+  }
+
+  String targetLower = target;
+  targetLower.toLowerCase();
+
+  Serial.print("Sending update request to: ");
+  Serial.print(targetLower);
+  Serial.print(" | bin=");
+  Serial.println(binFile);
+
+  sendMaintenancePacketToTarget(
+    targetLower.c_str(),
+    LEC_PKT_BULK_UPDATE_REQUEST,
+    "bulk-update",
+    binFile.c_str()
+  );
+}
+
+void handleRebootCommand(const String& rawCommand) {
+  String target = getArgToken(rawCommand, 1);
+
+  if (target.length() == 0) {
+    Serial.println("Usage: reboot <all|generic|pantry|claimedId>");
+    return;
+  }
+
+  target.toLowerCase();
+
+  Serial.print("Sending reboot request to: ");
+  Serial.println(target);
+
+  sendMaintenancePacketToTarget(
+    target.c_str(),
+    LEC_PKT_REBOOT_REQUEST,
+    "reboot",
+    nullptr
+  );
+}
+
+/*************************************************************
+  NODE HELPERS
+*************************************************************/
+
+int findNodeByMac(const uint8_t* mac) {
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (!nodes[i].used) continue;
+
+    if (lecMacEquals(nodes[i].mac, mac)) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+int upsertNode(const uint8_t* mac, const LecPacket& packet) {
+  int existing = findNodeByMac(mac);
+
+  if (existing != -1) {
+    nodes[existing].online = true;
+    nodes[existing].lastSeenMs = millis();
+    nodes[existing].lastSequence = packet.sequence;
+    nodes[existing].deviceClass = packet.deviceClass;
+    nodes[existing].runMode = packet.runMode;
+
+    strncpy(nodes[existing].firmwareVersion, packet.firmwareVersion, LEC_FW_VERSION_LENGTH - 1);
+    nodes[existing].firmwareVersion[LEC_FW_VERSION_LENGTH - 1] = '\0';
+
+    strncpy(nodes[existing].status, packet.status, LEC_STATUS_LENGTH - 1);
+    nodes[existing].status[LEC_STATUS_LENGTH - 1] = '\0';
+
+    return existing;
+  }
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (nodes[i].used) continue;
+
+    memset(&nodes[i], 0, sizeof(ServerNode));
+
+    nodes[i].used = true;
+    nodes[i].online = true;
+
+    memcpy(nodes[i].mac, mac, 6);
+
+    nodes[i].deviceClass = packet.deviceClass;
+    nodes[i].assignedRole = LEC_ROLE_NONE;
+    nodes[i].runMode = packet.runMode;
+
+    strncpy(nodes[i].claimedId, packet.claimedId, LEC_CLAIMED_ID_LENGTH - 1);
+    nodes[i].claimedId[LEC_CLAIMED_ID_LENGTH - 1] = '\0';
+
+    strncpy(nodes[i].firmwareVersion, packet.firmwareVersion, LEC_FW_VERSION_LENGTH - 1);
+    nodes[i].firmwareVersion[LEC_FW_VERSION_LENGTH - 1] = '\0';
+
+    strncpy(nodes[i].status, packet.status, LEC_STATUS_LENGTH - 1);
+    nodes[i].status[LEC_STATUS_LENGTH - 1] = '\0';
+
+    nodes[i].lastSeenMs = millis();
+    nodes[i].lastSequence = packet.sequence;
+
+    if (nodes[i].deviceClass == LEC_DEVICE_INGREDIENT_STATION) {
+      nodes[i].assignedRole = LEC_ROLE_INGREDIENT_STATION;
+    }
+
+    Serial.print("Registered new node: ");
+    Serial.println(lecMacToString(mac));
+
+    return i;
+  }
+
+  Serial.println("Node roster full.");
+  return -1;
+}
+
+bool addPeerIfNeeded(const uint8_t* mac) {
+  if (esp_now_is_peer_exist(mac)) {
+    return true;
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, mac, 6);
+  peerInfo.channel = LEC_ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+
+  esp_err_t result = esp_now_add_peer(&peerInfo);
+
+  if (result == ESP_OK) {
+    Serial.print("Added peer: ");
+    Serial.println(lecMacToString(mac));
+    return true;
+  }
+
+  Serial.print("Failed to add peer. Code: ");
+  Serial.println(result);
+  return false;
+}
+
+int countGenericClients() {
+  int count = 0;
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (nodes[i].used && nodes[i].deviceClass == LEC_DEVICE_GENERIC_CLIENT) {
+      count++;
+    }
+  }
+
+  return count;
+}
+
+void collectGenericClientIndexes(int* indexes, int& count) {
+  count = 0;
+
+  for (int i = 0; i < SERVER_MAX_NODES; i++) {
+    if (nodes[i].used && nodes[i].deviceClass == LEC_DEVICE_GENERIC_CLIENT) {
+      indexes[count++] = i;
+    }
+  }
+}
+
+void shuffleIndexes(int* indexes, int count) {
+  for (int i = count - 1; i > 0; i--) {
+    int j = random(0, i + 1);
+
+    int temp = indexes[i];
+    indexes[i] = indexes[j];
+    indexes[j] = temp;
+  }
+}
+
+/*************************************************************
+  PLATE HELPERS
+*************************************************************/
+
+void initializePlates() {
+  const char* knownRFIDs[] = {
     "30ED1279",
     "E0EC1279",
     "F0EC1279",
@@ -1999,391 +2211,336 @@ void initializeRFIDData() {
     "D0EC1279"
   };
 
-  // Clear array
-  memset(rfidDataArray, 0, sizeof(rfidDataArray));
-  rfidDataCount = 0;
+  plateCount = 0;
+  memset(plates, 0, sizeof(plates));
 
-  // Add each known RFID plate with default values.
-  for (int i = 0; i < initialRFIDCount; i++) {
-    struct_message newRFIDData;
-    memset(&newRFIDData, 0, sizeof(newRFIDData));
+  for (int i = 0; i < 6; i++) {
+    int index = findOrCreatePlate(knownRFIDs[i]);
 
-    strncpy(newRFIDData.rfid, knownRFIDs[i], RFID_LENGTH - 1);
-    strncpy(newRFIDData.ingredient, "none", INGREDIENT_LENGTH - 1);
-    newRFIDData.chopCount = 0;
-    newRFIDData.cookCount = 0;
-    newRFIDData.playerScoreDelta = 0;
-    newRFIDData.reset = false;
-    strncpy(newRFIDData.requestType, "DataUpdate", REQUEST_TYPE_LENGTH - 1);
-    newRFIDData.role = ROLE_NONE;
-    strncpy(newRFIDData.recipeName, "none", MAX_RECIPE_NAME_LENGTH - 1);
+    if (index != -1) {
+      strncpy(plates[index].ingredient, "none", INGREDIENT_LENGTH - 1);
+      plates[index].ingredient[INGREDIENT_LENGTH - 1] = '\0';
 
-    addRFIDData(&newRFIDData);
-  }
-
-  Serial.println("RFID data initialized with known plates (default values).");
-}
-
-void reinitializeRFIDData() {
-  if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
-    for (int i = 0; i < rfidDataCount; i++) {
-      strncpy(rfidDataArray[i].ingredient, "none", INGREDIENT_LENGTH - 1);
-      rfidDataArray[i].chopCount = 0;
-      rfidDataArray[i].cookCount = 0;
-      rfidDataArray[i].playerScoreDelta = 0;
-      rfidDataArray[i].reset = false;
-      strncpy(rfidDataArray[i].requestType, "DataUpdate", REQUEST_TYPE_LENGTH - 1);
-      rfidDataArray[i].role = ROLE_NONE;
-      strncpy(rfidDataArray[i].recipeName, "none", MAX_RECIPE_NAME_LENGTH - 1);
+      plates[index].chopCount = 0;
+      plates[index].cookCount = 0;
+      plates[index].status = LEC_PLATE_ACTIVE;
     }
-    Serial.println("RFID data reinitialized to default.");
+  }
+
+  Serial.println("Plate data initialized.");
+}
+
+void resetAllPlates() {
+  if (xSemaphoreTake(xMutex, portMAX_DELAY)) {
+    for (int i = 0; i < plateCount; i++) {
+      strncpy(plates[i].ingredient, "none", INGREDIENT_LENGTH - 1);
+      plates[i].ingredient[INGREDIENT_LENGTH - 1] = '\0';
+
+      plates[i].chopCount = 0;
+      plates[i].cookCount = 0;
+      plates[i].status = LEC_PLATE_ACTIVE;
+      plates[i].updatedAtMs = millis();
+    }
+
     xSemaphoreGive(xMutex);
-  } else {
-    Serial.println("Failed to acquire mutex for reinitRFIDData.");
   }
+
+  Serial.println("All plates reset.");
 }
 
-/*************************************************************
-    ADD/REMOVE RFID
-*************************************************************/
-bool addRFIDData(const struct_message* data) {
-  if (rfidDataCount >= MAX_PLATES) {
-    Serial.println("RFID data array is full!");
-    return false;
-  }
-  memcpy(&rfidDataArray[rfidDataCount], data, sizeof(struct_message));
-  rfidDataCount++;
-  return true;
-}
+int findPlateIndex(const char* rfid) {
+  if (!rfid || rfid[0] == '\0') return -1;
 
-bool addRFID(const char* rfidUID) {
-  if (rfidDataCount >= MAX_PLATES) {
-    Serial.println("Cannot add RFID: Array is full.");
-    return false;
-  }
-  if (findRFIDIndex(rfidUID) != -1) {
-    Serial.println("Cannot add RFID: Already exists.");
-    return false;
-  }
-
-  struct_message newRFIDData;
-  memset(&newRFIDData, 0, sizeof(newRFIDData));
-  strncpy(newRFIDData.rfid, rfidUID, RFID_LENGTH - 1);
-  strncpy(newRFIDData.ingredient, "none", INGREDIENT_LENGTH - 1);
-  newRFIDData.chopCount = 0;
-  newRFIDData.cookCount = 0;
-  newRFIDData.playerScoreDelta = 0;
-  newRFIDData.reset = false;
-  strncpy(newRFIDData.requestType, "DataUpdate", REQUEST_TYPE_LENGTH - 1);
-  newRFIDData.role = ROLE_NONE;
-  strncpy(newRFIDData.recipeName, "none", MAX_RECIPE_NAME_LENGTH - 1);
-
-  if (addRFIDData(&newRFIDData)) {
-    Serial.println("Successfully added new RFID to array.");
-    return true;
-  } else {
-    Serial.println("Failed to add RFID to array.");
-    return false;
-  }
-}
-
-bool removeRFIDFromArray(const char* rfidUID) {
-  int index = findRFIDIndex(rfidUID);
-  if (index == -1) {
-    Serial.println("Cannot remove RFID: Not found.");
-    return false;
-  }
-
-  for (int i = index; i < rfidDataCount - 1; i++) {
-    rfidDataArray[i] = rfidDataArray[i + 1];
-  }
-  rfidDataCount--;
-
-  Serial.println("Removed RFID from array.");
-  return true;
-}
-
-int findRFIDIndex(const char* rfid) {
-  for (int i = 0; i < rfidDataCount; i++) {
-    if (strncmp(rfidDataArray[i].rfid, rfid, RFID_LENGTH) == 0) {
+  for (int i = 0; i < plateCount; i++) {
+    if (strncmp(plates[i].rfid, rfid, RFID_LENGTH) == 0) {
       return i;
     }
   }
+
   return -1;
 }
 
-/*************************************************************
-    SENDING DATA BACK TO CLIENT
-*************************************************************/
-void sendDataBackToClient(const uint8_t* mac_addr, struct_message* message) {
-  Serial.println("=== Sending Data to Client ===");
-  Serial.print("To MAC: ");
-  for (int i = 0; i < 6; i++) {
-    Serial.printf("%02X", mac_addr[i]);
-    if (i < 5) Serial.print(":");
-  }
-  Serial.println();
-  Serial.print("RFID: ");      Serial.println(message->rfid);
-  Serial.print("Ingredient: ");Serial.println(message->ingredient);
-  Serial.print("ChopCount: "); Serial.println(message->chopCount);
-  Serial.print("CookCount: "); Serial.println(message->cookCount);
-  Serial.print("ScoreDelta: ");Serial.println(message->playerScoreDelta);
-  Serial.print("Reset: ");     Serial.println(message->reset ? "true" : "false");
-  Serial.print("ReqType: ");   Serial.println(message->requestType);
-  Serial.print("Role: ");      Serial.println(message->role);
-  Serial.print("Recipe: ");    Serial.println(message->recipeName);
-  Serial.println("===============================");
+int findOrCreatePlate(const char* rfid) {
+  int existing = findPlateIndex(rfid);
 
-  esp_err_t result = esp_now_send(mac_addr, (uint8_t*)message, sizeof(struct_message));
-  if (result != ESP_OK) {
-    Serial.print("Error sending data to client: ");
-    Serial.println(result);
-  } else {
-    Serial.println("Data sent to client successfully.");
+  if (existing != -1) {
+    return existing;
   }
+
+  if (plateCount >= MAX_PLATES) {
+    return -1;
+  }
+
+  int index = plateCount++;
+
+  lecInitPlate(plates[index]);
+  lecSetPlateRfid(plates[index], rfid);
+  lecSetPlateIngredient(plates[index], "none");
+
+  plates[index].chopCount = 0;
+  plates[index].cookCount = 0;
+  plates[index].status = LEC_PLATE_ACTIVE;
+
+  return index;
 }
 
 /*************************************************************
-    ADD ALL PEERS
+  RFID
 *************************************************************/
-void addAllPeers() {
-  Serial.println("Adding peers from macToRoleMap...");
 
-  // Get server's own MAC
-  String serverMacStr = WiFi.macAddress();
-  Serial.print("Server's own MAC: ");
-  Serial.println(serverMacStr);
+bool readRFID(char* rfidUID) {
+  if (!rfidUID) return false;
 
-  for (const auto& entry : macToRoleMap) {
-    uint8_t macBytes[6];
-    if (stringToMAC(entry.first, macBytes)) {
-      String clientMacStr = String(entry.first.c_str());
-      if (clientMacStr.equalsIgnoreCase(serverMacStr)) {
-        Serial.print("Skipping server's own MAC: ");
-        Serial.println(entry.first.c_str());
+  if (PICC_IsAnyCardPresent() && rfid.PICC_ReadCardSerial()) {
+    snprintf(
+      rfidUID,
+      RFID_LENGTH,
+      "%02X%02X%02X%02X",
+      rfid.uid.uidByte[0],
+      rfid.uid.uidByte[1],
+      rfid.uid.uidByte[2],
+      rfid.uid.uidByte[3]
+    );
+
+    rfidUID[RFID_LENGTH - 1] = '\0';
+
+    resetRFIDReader();
+    return true;
+  }
+
+  return false;
+}
+
+bool PICC_IsAnyCardPresent() {
+  byte bufferATQA[2];
+  byte bufferSize = sizeof(bufferATQA);
+
+  rfid.PCD_WriteRegister(rfid.TxModeReg, 0x00);
+  rfid.PCD_WriteRegister(rfid.RxModeReg, 0x00);
+  rfid.PCD_WriteRegister(rfid.ModWidthReg, 0x26);
+
+  MFRC522::StatusCode result = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+
+  return result == MFRC522::STATUS_OK || result == MFRC522::STATUS_COLLISION;
+}
+
+void resetRFIDReader() {
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+/*************************************************************
+  PI SCOREBOARD
+*************************************************************/
+
+int getTimeLeftInSeconds() {
+  if (!gameRunning || roundStartTime == 0) {
+    return 0;
+  }
+
+  unsigned long elapsed = millis() - roundStartTime;
+
+  if (elapsed >= roundDuration) {
+    return 0;
+  }
+
+  return static_cast<int>((roundDuration - elapsed) / 1000);
+}
+
+String getStarThresholdString() {
+  return String(starThresholds[0]) + "," +
+         String(starThresholds[1]) + "," +
+         String(starThresholds[2]);
+}
+
+void startPiScoreboardTask() {
+  piQueue = xQueueCreate(8, sizeof(PiJob));
+
+  if (piQueue == nullptr) {
+    Serial.println("Failed to create Pi scoreboard queue.");
+    return;
+  }
+
+  xTaskCreatePinnedToCore(
+    piScoreboardTask,
+    "PiScoreboardTask",
+    8192,
+    nullptr,
+    1,
+    &piTaskHandle,
+    0
+  );
+
+  Serial.println("Pi scoreboard async task started.");
+}
+
+void piScoreboardTask(void* parameter) {
+  PiJob job;
+
+  while (true) {
+    if (xQueueReceive(piQueue, &job, portMAX_DELAY) == pdTRUE) {
+      if (!connectedToScoreboard || WiFi.status() != WL_CONNECTED) {
         continue;
       }
 
-      if (!esp_now_is_peer_exist(macBytes)) {
-        esp_now_peer_info_t peerInfo = {};
-        memcpy(peerInfo.peer_addr, macBytes, 6);
-        peerInfo.channel = 0;
-        peerInfo.encrypt = false;
+      switch (job.type) {
+        case PI_JOB_START:
+          performPiStartGame(job);
+          break;
 
-        esp_err_t addPeerStatus = esp_now_add_peer(&peerInfo);
-        if (addPeerStatus == ESP_OK) {
-          Serial.print("Successfully added peer: ");
-          Serial.println(entry.first.c_str());
-        } else {
-          Serial.print("Failed to add peer (code ");
-          Serial.print(addPeerStatus);
-          Serial.println("):");
-          Serial.println(entry.first.c_str());
-        }
-      } else {
-        Serial.print("Peer already exists: ");
-        Serial.println(entry.first.c_str());
+        case PI_JOB_UPDATE:
+          performPiUpdate(job);
+          break;
+
+        case PI_JOB_END:
+          performPiEndGame(job);
+          break;
       }
-    } else {
-      Serial.print("Invalid MAC address format: ");
-      Serial.println(entry.first.c_str());
     }
   }
+}
 
-  Serial.println("Completed adding peers.");
+void queuePiStartGame(unsigned long durationSec) {
+  if (!connectedToScoreboard || piQueue == nullptr) {
+    return;
+  }
+
+  PiJob job = {};
+  job.type = PI_JOB_START;
+  job.durationSec = durationSec;
+
+  xQueueSend(piQueue, &job, 0);
+}
+
+void queuePiEndGame(const String& reason, int finalScore) {
+  if (!connectedToScoreboard || piQueue == nullptr) {
+    return;
+  }
+
+  PiJob job = {};
+  job.type = PI_JOB_END;
+  job.finalScore = finalScore;
+
+  strncpy(job.reason, reason.c_str(), sizeof(job.reason) - 1);
+  job.reason[sizeof(job.reason) - 1] = '\0';
+
+  xQueueSend(piQueue, &job, 0);
+}
+
+void queuePiUpdate(int score, int timeLeftSec) {
+  if (!connectedToScoreboard || piQueue == nullptr) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastPiUpdateQueuedAt < PI_UPDATE_QUEUE_INTERVAL_MS) {
+    return;
+  }
+
+  lastPiUpdateQueuedAt = now;
+
+  PiJob job = {};
+  job.type = PI_JOB_UPDATE;
+  job.score = score;
+  job.timeLeftSec = timeLeftSec;
+
+  if (currentRecipeValid) {
+    strncpy(job.currentRecipe, currentRecipe.name, sizeof(job.currentRecipe) - 1);
+    job.currentRecipe[sizeof(job.currentRecipe) - 1] = '\0';
+  }
+
+  if (nextRecipeValid) {
+    strncpy(job.nextRecipe, nextRecipe.name, sizeof(job.nextRecipe) - 1);
+    job.nextRecipe[sizeof(job.nextRecipe) - 1] = '\0';
+  }
+
+  xQueueSend(piQueue, &job, 0);
+}
+
+void performPiStartGame(const PiJob& job) {
+  HTTPClient http;
+  http.setTimeout(PI_HTTP_TIMEOUT_MS);
+
+  http.begin(SCOREBOARD_START_URL);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData =
+    "duration=" + String(job.durationSec) +
+    "&star_thresholds=" + getStarThresholdString() +
+    "&max_score=" + String(starMaxScore);
+
+  int httpCode = http.POST(postData);
+  http.end();
+
+#if LEC_DEBUG
+  Serial.print("Async start_game HTTP: ");
+  Serial.println(httpCode);
+#endif
+}
+
+void performPiEndGame(const PiJob& job) {
+  HTTPClient http;
+  http.setTimeout(PI_HTTP_TIMEOUT_MS);
+
+  http.begin(SCOREBOARD_END_URL);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData =
+    "score=" + String(job.finalScore) +
+    "&reason=" + String(job.reason);
+
+  int httpCode = http.POST(postData);
+  http.end();
+
+#if LEC_DEBUG
+  Serial.print("Async end_game HTTP: ");
+  Serial.println(httpCode);
+#endif
+}
+
+void performPiUpdate(const PiJob& job) {
+  HTTPClient http;
+  http.setTimeout(PI_HTTP_TIMEOUT_MS);
+
+  http.begin(SCOREBOARD_UPDATE_URL);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData =
+    "score=" + String(job.score) +
+    "&time_left=" + String(job.timeLeftSec) +
+    "&star_thresholds=" + getStarThresholdString() +
+    "&max_score=" + String(starMaxScore) +
+    "&current_recipe=" + String(job.currentRecipe) +
+    "&next_recipe=" + String(job.nextRecipe);
+
+  int httpCode = http.POST(postData);
+  http.end();
+
+#if LEC_DEBUG
+  Serial.print("Async scoreboard update HTTP: ");
+  Serial.println(httpCode);
+#endif
+}
+
+void notifyPiStartGame(unsigned long durationSec) {
+  queuePiStartGame(durationSec);
+}
+
+void notifyPiEndGame(const String& reason, int finalScore) {
+  queuePiEndGame(reason, finalScore);
+}
+
+void updateScoreAndTimeOnPi(int score, int timeLeftSec) {
+  queuePiUpdate(score, timeLeftSec);
 }
 
 /*************************************************************
-    SENDING REINITIALIZE / ROLE
+  LED FEEDBACK
 *************************************************************/
-void sendReinitializeToClient(const uint8_t* clientAddress) {
-  struct_message reinitMsg;
-  memset(&reinitMsg, 0, sizeof(reinitMsg));
-  strncpy(reinitMsg.requestType, "Reinitialize", REQUEST_TYPE_LENGTH - 1);
-
-  esp_now_peer_info_t peerInfo = {};
-  memcpy(peerInfo.peer_addr, clientAddress, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-
-  if (!esp_now_is_peer_exist(clientAddress)) {
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-      Serial.println("Failed to add client as peer for Reinitialize");
-      return;
-    }
-  }
-
-  esp_err_t result = esp_now_send(clientAddress, (uint8_t*)&reinitMsg, sizeof(struct_message));
-  if (result == ESP_OK) {
-    Serial.println("Reinitialize message sent to client.");
-  } else {
-    Serial.print("Error sending Reinitialize: ");
-    Serial.println(result);
-  }
-}
-
-void sendReinitializeToAllClients() {
-  Serial.println("Sending Reinitialize command to all clients...");
-  for (const auto& entry : macToRoleMap) {
-    uint8_t macBytes[6];
-    if (stringToMAC(entry.first, macBytes)) {
-      sendReinitializeToClient(macBytes);
-    } else {
-      Serial.print("Failed to convert MAC string: ");
-      Serial.println(entry.first.c_str());
-    }
-  }
-  Serial.println("Completed sending Reinitialize to all.");
-}
-
-void sendRoleAssignmentToAllClients() {
-  Serial.println("Sending RoleAssignment messages to all clients...");
-  for (const auto& entry : macToRoleMap) {
-    uint8_t macBytes[6];
-    if (stringToMAC(entry.first, macBytes)) {
-      struct_message roleMsg;
-      memset(&roleMsg, 0, sizeof(roleMsg));
-      strncpy(roleMsg.requestType, "RoleAssignment", REQUEST_TYPE_LENGTH - 1);
-      roleMsg.role = entry.second;
-
-      sendDataBackToClient(macBytes, &roleMsg);
-      Serial.print("Sent RoleAssignment to MAC: ");
-      Serial.println(entry.first.c_str());
-    } else {
-      Serial.print("Failed to convert MAC string: ");
-      Serial.println(entry.first.c_str());
-    }
-  }
-  Serial.println("Done sending RoleAssignment.");
-}
-
-/*************************************************************
-    HELPER FUNCTIONS
-*************************************************************/
-bool readRFID(char* rfidUID) {
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
-    return false;
-  }
-
-  String uidStr = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    uidStr += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
-    uidStr += String(rfid.uid.uidByte[i], HEX);
-  }
-  uidStr.toUpperCase();
-
-  strncpy(rfidUID, uidStr.c_str(), RFID_LENGTH - 1);
-
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
-  return true;
-}
 
 void blinkButtonLED(int ledPin) {
-  digitalWrite(ledPin, LOW);
-  delay(100);
   digitalWrite(ledPin, HIGH);
-}
-
-// Convert MAC to String
-String macToString(const uint8_t* mac_addr) {
-  char macStr[18];
-  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac_addr[0], mac_addr[1], mac_addr[2],
-           mac_addr[3], mac_addr[4], mac_addr[5]);
-  return String(macStr);
-}
-
-// Convert string "AA:BB:CC:DD:EE:FF" to byte array
-bool stringToMAC(const std::string& macStr, uint8_t* macBytes) {
-  if (macStr.length() != 17) {
-    Serial.print("Invalid MAC string length: ");
-    Serial.println(macStr.c_str());
-    return false;
-  }
-  unsigned int bytes[6];
-  int scanned = sscanf(macStr.c_str(), "%02X:%02X:%02X:%02X:%02X:%02X",
-                       &bytes[0], &bytes[1], &bytes[2],
-                       &bytes[3], &bytes[4], &bytes[5]);
-  if (scanned != 6) {
-    Serial.print("Failed to parse MAC string: ");
-    Serial.println(macStr.c_str());
-    return false;
-  }
-  for (int i = 0; i < 6; i++) {
-    macBytes[i] = static_cast<uint8_t>(bytes[i]);
-  }
-  return true;
-}
-
-// Parse requestType string into enum
-RequestType getRequestType(const char* requestTypeStr) {
-  if (strncmp(requestTypeStr, "DataRequest", REQUEST_TYPE_LENGTH) == 0) {
-    return DATA_REQUEST;
-  } else if (strncmp(requestTypeStr, "DataUpdate", REQUEST_TYPE_LENGTH) == 0) {
-    return DATA_UPDATE;
-  } else if (strncmp(requestTypeStr, "RoleRequest", REQUEST_TYPE_LENGTH) == 0) {
-    return ROLE_REQUEST;
-  } else if (strncmp(requestTypeStr, "CurrentRecipeRequest", REQUEST_TYPE_LENGTH) == 0) {
-    return CURRENT_RECIPE_REQUEST;
-  } else if (strncmp(requestTypeStr, "CurrentRecipeResponse", REQUEST_TYPE_LENGTH) == 0) {
-    return CURRENT_RECIPE_RESPONSE;
-  } else if (strncmp(requestTypeStr, "SelectNewRecipe", REQUEST_TYPE_LENGTH) == 0) {
-    return SELECT_NEW_RECIPE;
-  } else if (strncmp(requestTypeStr, "Reinitialize", REQUEST_TYPE_LENGTH) == 0) {
-    return REINITIALIZE;
-  } else if (strncmp(requestTypeStr, "NewRecipe", REQUEST_TYPE_LENGTH) == 0) {
-    return NEW_RECIPE;
-  } else if (strncmp(requestTypeStr, "RoleAssignment", REQUEST_TYPE_LENGTH) == 0) {
-    return ROLE_ASSIGNMENT;
-  }
-  // --- NEW FIRE LOGIC: 3 new comparisons ---
-  else if (strncmp(requestTypeStr, "Burnt", REQUEST_TYPE_LENGTH) == 0) {
-    return BURNT;
-  } else if (strncmp(requestTypeStr, "OnFire", REQUEST_TYPE_LENGTH) == 0) {
-    return ON_FIRE;
-  } else if (strncmp(requestTypeStr, "ExtinguishFire", REQUEST_TYPE_LENGTH) == 0) {
-    return EXTINGUISH_FIRE;
-  }
-
-  return UNKNOWN_REQUEST;
-}
-
-/*************************************************************
-    INITIALIZE HARDWARE
-*************************************************************/
-void initializeHardware() {
-  // RFID
-  SPI.begin();
-  rfid.PCD_Init();
-  Serial.println("RFID reader initialized.");
-
-  // Buttons
-  pinMode(GREEN_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(RED_BUTTON_PIN, INPUT_PULLUP);
-
-  // Button LEDs
-  pinMode(GREEN_BUTTON_LED_PIN, OUTPUT);
-  digitalWrite(GREEN_BUTTON_LED_PIN, HIGH); // turn on
-  pinMode(RED_BUTTON_LED_PIN, OUTPUT);
-  digitalWrite(RED_BUTTON_LED_PIN, HIGH); // turn on
-
-  // Audio module
-  audioSerial.begin(9600, SERIAL_8N1, AUDIO_RX, AUDIO_TX);
-  audioModule.begin();
-  audioModule.setCycleMode(DY::PlayMode::OneOff);
-  audioModule.setVolume(15);
-  audioModule.stop();
-
-  // Sprite media player
-  spriteSerial.begin(9600, SERIAL_8N1, SPRITE_RX, SPRITE_TX);
-  byte playCommand = 0x00;
-  spriteSerial.write(playCommand);
-
-  // Fire button & LED
-  pinMode(FIRE_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(FIRE_LED_PIN, OUTPUT);
-  digitalWrite(FIRE_LED_PIN, LOW);
-
-  Serial.println("Hardware initialization complete.");
+  delay(100);
+  digitalWrite(ledPin, LOW);
 }
