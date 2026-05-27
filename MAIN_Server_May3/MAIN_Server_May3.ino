@@ -40,8 +40,6 @@ const char* SCOREBOARD_START_URL  = "http://10.42.0.1:5000/start_game";
 const char* SCOREBOARD_END_URL    = "http://10.42.0.1:5000/end_game";
 const char* SCOREBOARD_UPDATE_URL = "http://10.42.0.1:5000/update_score";
 
-bool connectedToScoreboard = false;
-
 /*************************************************************
   ASYNC PI SCOREBOARD QUEUE
 *************************************************************/
@@ -72,6 +70,16 @@ TaskHandle_t piTaskHandle = nullptr;
 unsigned long lastPiUpdateQueuedAt = 0;
 const unsigned long PI_UPDATE_QUEUE_INTERVAL_MS = 750;
 const uint16_t PI_HTTP_TIMEOUT_MS = 500;
+
+bool connectedToScoreboard = false;
+
+// Scoreboard reconnect settings.
+// Keep attempts short so the game can run even if the Pi is off/unplugged
+unsigned long lastScoreboardReconnectAttemptMs = 0;
+const unsigned long SCOREBOARD_RECONNECT_INTERVAL_MS = 10000UL;
+const unsigned long SCOREBOARD_CONNECT_TIMEOUT_MS = 750UL;
+
+bool piStartSentForCurrentGame = false;
 
 
 /*************************************************************
@@ -125,6 +133,10 @@ DY::Player audioModule(&audioSerial);
 
 const int starThresholds[3] = {2, 4, 6};
 const int starMaxScore = 6;
+
+const int SCORE_PER_SUCCESSFUL_SERVE = 1;
+const int ROUND_1_COMPLETE_BONUS = 1;
+const int GAME_COMPLETE_BONUS = 2;
 
 #define ROUND_1_COUNTDOWN_DELAY_MS 6500UL
 
@@ -219,6 +231,9 @@ bool fireLedState = LOW;
 *************************************************************/
 
 void connectToScoreboardWithTimeout();
+bool tryConnectToScoreboardOnce(unsigned long timeoutMs);
+void processScoreboardReconnect();
+
 void initializeHardware();
 void initializeEspNow();
 
@@ -434,6 +449,8 @@ void setup() {
 void loop() {
   processIncomingPackets();
 
+  processScoreboardReconnect();
+
   handleSerialCommands();
   handleButtons();
 
@@ -457,23 +474,21 @@ void loop() {
   INIT
 *************************************************************/
 
-void connectToScoreboardWithTimeout() {
-  Serial.println("Connecting to scoreboard AP...");
+bool tryConnectToScoreboardOnce(unsigned long timeoutMs) {
+  WiFi.mode(WIFI_STA);
+  delay(50);
 
   WiFi.begin(scoreboardSSID, scoreboardPassword, LEC_ESPNOW_CHANNEL);
 
   unsigned long start = millis();
-  const unsigned long timeout = 10000;
 
-  while (WiFi.status() != WL_CONNECTED && millis() - start < timeout) {
-    delay(500);
-    Serial.print(".");
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    delay(100);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
     connectedToScoreboard = true;
 
-    Serial.println();
     Serial.println("Connected to scoreboard AP.");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
@@ -484,16 +499,79 @@ void connectToScoreboardWithTimeout() {
       Serial.println("WARNING: Scoreboard AP channel does not match LEC_ESPNOW_CHANNEL.");
       Serial.println("ESP-NOW clients may not communicate correctly.");
     }
-  } else {
+
+    return true;
+  }
+
+  connectedToScoreboard = false;
+
+  // Important: return to STA mode and force ESP-NOW channel after failed WiFi attempt.
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_STA);
+  delay(50);
+  esp_wifi_set_channel(LEC_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  return false;
+}
+
+void connectToScoreboardWithTimeout() {
+  Serial.println("Connecting to scoreboard AP...");
+
+  if (!tryConnectToScoreboardOnce(10000UL)) {
+    Serial.println("Scoreboard AP unavailable at boot. Continuing with ESP-NOW only.");
+    Serial.println("Will keep retrying scoreboard connection in background.");
+  }
+}
+
+void processScoreboardReconnect() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!connectedToScoreboard) {
+      connectedToScoreboard = true;
+
+      Serial.println("Scoreboard reconnected.");
+
+      if (gameRunning) {
+        Serial.println("Resyncing scoreboard after reconnect.");
+
+        notifyPiStartGame(getTimeLeftInSeconds());
+        piStartSentForCurrentGame = true;
+
+        updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
+      }
+    }
+
+    return;
+  }
+
+  if (connectedToScoreboard) {
     connectedToScoreboard = false;
+    Serial.println("Scoreboard WiFi lost. Will retry.");
+  }
 
-    Serial.println();
-    Serial.println("Scoreboard AP unavailable. Continuing with ESP-NOW only.");
+  // Avoid reconnect attempts during sensitive role/recipe/round transitions.
+  if (pendingRoleAssignmentBroadcast || pendingRecipeBroadcast || pendingRoundTransition) {
+    return;
+  }
 
-    WiFi.disconnect(false);
-    WiFi.mode(WIFI_STA);
-    delay(100);
-    esp_wifi_set_channel(LEC_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  unsigned long now = millis();
+
+  if (now - lastScoreboardReconnectAttemptMs < SCOREBOARD_RECONNECT_INTERVAL_MS) {
+    return;
+  }
+
+  lastScoreboardReconnectAttemptMs = now;
+
+  Serial.println("Attempting scoreboard reconnect...");
+
+  bool reconnected = tryConnectToScoreboardOnce(SCOREBOARD_CONNECT_TIMEOUT_MS);
+
+  if (reconnected && gameRunning) {
+    Serial.println("Scoreboard reconnected during active game. Sending state.");
+
+    notifyPiStartGame(getTimeLeftInSeconds());
+    piStartSentForCurrentGame = true;
+
+    updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
   }
 }
 
@@ -662,9 +740,15 @@ void handleSerialCommands() {
 
   } else if (lowerCmd == "recipe") {
     pickRecipeForRound(currentRound, currentRecipe, currentRecipeValid);
-    pickRecipeForRound(currentRound, nextRecipe, nextRecipeValid);
-    broadcastCurrentRecipe();
 
+    pickDifferentRecipeForRound(
+      currentRound,
+      currentRecipeValid ? currentRecipe.name : "",
+      nextRecipe,
+      nextRecipeValid
+    );
+
+    broadcastCurrentRecipe();
   } else if (lowerCmd == "fire") {
     onFire = true;
     digitalWrite(FIRE_LED_PIN, HIGH);
@@ -721,7 +805,14 @@ void handleGreenButton() {
           startGame();
         } else {
           pickRecipeForRound(currentRound, currentRecipe, currentRecipeValid);
-          pickRecipeForRound(currentRound, nextRecipe, nextRecipeValid);
+
+          pickDifferentRecipeForRound(
+            currentRound,
+            currentRecipeValid ? currentRecipe.name : "",
+            nextRecipe,
+            nextRecipeValid
+          );
+
           broadcastCurrentRecipe();
         }
       }
@@ -842,6 +933,8 @@ void startGame() {
 
   roleAssignmentSendsRemaining = 0;
 
+  piStartSentForCurrentGame = false;
+
   startRound(LEC_ROUND_1);
 }
 
@@ -875,7 +968,6 @@ void startRound(LecRound round) {
 
   pickRecipeForRound(currentRound, currentRecipe, currentRecipeValid);
 
-  // Make nextRecipe different from currentRecipe where possible.
   pickDifferentRecipeForRound(
     currentRound,
     currentRecipeValid ? currentRecipe.name : "",
@@ -890,7 +982,10 @@ void startRound(LecRound round) {
 
     pendingRecipeBroadcast = false;
 
-    notifyPiStartGame(roundDuration / 1000);
+    if (connectedToScoreboard) {
+      notifyPiStartGame(roundDuration / 1000);
+      piStartSentForCurrentGame = true;
+    }
   } else {
     // Round 2 starts role assignment immediately,
     // but still retries safely.
@@ -1581,7 +1676,7 @@ void handleServeAttempt(const uint8_t* mac, const LecPacket& packet) {
       if (success) {
         Serial.println("Serve success.");
 
-        playerScore += 1;
+        playerScore += SCORE_PER_SUCCESSFUL_SERVE;
         correctServesInRound += 1;
 
         roundDuration += 15000UL;
@@ -1645,6 +1740,16 @@ void handleServeAttempt(const uint8_t* mac, const LecPacket& packet) {
 
   if (success) {
     if (roundComplete) {
+      if (currentRound == LEC_ROUND_1) {
+        playerScore += ROUND_1_COMPLETE_BONUS;
+        Serial.println("Round 1 complete bonus awarded.");
+      } else if (currentRound == LEC_ROUND_2) {
+        playerScore += GAME_COMPLETE_BONUS;
+        Serial.println("Game complete bonus awarded.");
+      }
+
+      updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
+
       endCurrentRound();
     } else {
       currentRecipe = nextRecipe;
