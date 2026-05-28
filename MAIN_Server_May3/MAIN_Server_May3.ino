@@ -81,6 +81,9 @@ const unsigned long SCOREBOARD_CONNECT_TIMEOUT_MS = 750UL;
 
 bool piStartSentForCurrentGame = false;
 
+bool pendingPiStartGame = false;
+unsigned long pendingPiStartDurationSec = 0;
+
 
 /*************************************************************
   ASYNC INCOMING ESP-NOW PACKET QUEUE
@@ -233,6 +236,7 @@ bool fireLedState = LOW;
 void connectToScoreboardWithTimeout();
 bool tryConnectToScoreboardOnce(unsigned long timeoutMs);
 void processScoreboardReconnect();
+void processPendingPiStartGame();
 
 void initializeHardware();
 void initializeEspNow();
@@ -450,6 +454,7 @@ void loop() {
   processIncomingPackets();
 
   processScoreboardReconnect();
+  processPendingPiStartGame();
 
   handleSerialCommands();
   handleButtons();
@@ -533,10 +538,11 @@ void processScoreboardReconnect() {
       if (gameRunning) {
         Serial.println("Resyncing scoreboard after reconnect.");
 
-        notifyPiStartGame(getTimeLeftInSeconds());
-        piStartSentForCurrentGame = true;
+        pendingPiStartDurationSec = getTimeLeftInSeconds();
+        pendingPiStartGame = true;
+        lastPiUpdateQueuedAt = 0;
 
-        updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
+        processPendingPiStartGame();
       }
     }
 
@@ -568,11 +574,31 @@ void processScoreboardReconnect() {
   if (reconnected && gameRunning) {
     Serial.println("Scoreboard reconnected during active game. Sending state.");
 
-    notifyPiStartGame(getTimeLeftInSeconds());
-    piStartSentForCurrentGame = true;
+    pendingPiStartDurationSec = getTimeLeftInSeconds();
+    pendingPiStartGame = true;
+    lastPiUpdateQueuedAt = 0;
 
-    updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
+    processPendingPiStartGame();
   }
+}
+
+void processPendingPiStartGame() {
+  if (!pendingPiStartGame) {
+    return;
+  }
+
+  if (!connectedToScoreboard || WiFi.status() != WL_CONNECTED || piQueue == nullptr) {
+    return;
+  }
+
+  notifyPiStartGame(pendingPiStartDurationSec);
+  piStartSentForCurrentGame = true;
+  pendingPiStartGame = false;
+
+  lastPiUpdateQueuedAt = 0;
+  updateScoreAndTimeOnPi(playerScore, getTimeLeftInSeconds());
+
+  Serial.println("Pending scoreboard start_game sent.");
 }
 
 void initializeHardware() {
@@ -848,7 +874,11 @@ void handleRedButton() {
 }
 
 void handleFireButton() {
-  if (!onFire) {
+  // Fire extinguisher button should do absolutely nothing
+  // unless the game is currently running and there is an active fire.
+  if (!gameRunning || !onFire) {
+    fireButtonPressStartTime = 0;
+    digitalWrite(FIRE_LED_PIN, LOW);
     return;
   }
 
@@ -870,12 +900,12 @@ void handleFireButton() {
         Serial.println("Fire extinguished by button.");
 
         onFire = false;
+        fireButtonPressStartTime = 0;
         digitalWrite(FIRE_LED_PIN, LOW);
 
         broadcastFireState(false);
 
-        // Client now handles returning to its role/recipe screen after 0x0B.
-        // Do not refresh recipe here or the serve station may replay its recipe screen twice.
+        // Do not refresh recipe here.
         pendingRecipeBroadcast = false;
       }
 
@@ -934,6 +964,8 @@ void startGame() {
   roleAssignmentSendsRemaining = 0;
 
   piStartSentForCurrentGame = false;
+  pendingPiStartGame = false;
+  pendingPiStartDurationSec = 0;
 
   startRound(LEC_ROUND_1);
 }
@@ -976,19 +1008,15 @@ void startRound(LecRound round) {
   );
 
   if (currentRound == LEC_ROUND_1) {
-    // After countdown, send role assignments multiple times.
-    // This protects against one client missing the first role packet.
     scheduleRoleAssignmentBroadcast(ROUND_1_COUNTDOWN_DELAY_MS);
 
     pendingRecipeBroadcast = false;
 
-    if (connectedToScoreboard) {
-      notifyPiStartGame(roundDuration / 1000);
-      piStartSentForCurrentGame = true;
-    }
+    pendingPiStartDurationSec = roundDuration / 1000;
+    pendingPiStartGame = true;
+
+    processPendingPiStartGame();
   } else {
-    // Round 2 starts role assignment immediately,
-    // but still retries safely.
     scheduleRoleAssignmentBroadcast(0);
 
     pendingRecipeBroadcast = false;
@@ -1769,7 +1797,14 @@ void handleServeAttempt(const uint8_t* mac, const LecPacket& packet) {
 }
 
 void handleFireRequest(const uint8_t* mac, const LecPacket& packet) {
-  if (onFire) return;
+  if (!gameRunning) {
+    Serial.println("Ignored fire request because game is not running.");
+    return;
+  }
+
+  if (onFire) {
+    return;
+  }
 
   Serial.println("Fire triggered by client.");
 
