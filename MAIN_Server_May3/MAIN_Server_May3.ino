@@ -40,6 +40,8 @@ const char* SCOREBOARD_START_URL  = "http://10.42.0.1:5000/start_game";
 const char* SCOREBOARD_END_URL    = "http://10.42.0.1:5000/end_game";
 const char* SCOREBOARD_UPDATE_URL = "http://10.42.0.1:5000/update_score";
 
+const char* STATS_RESULT_URL = "http://10.42.0.1:5001/api/game-result";
+
 /*************************************************************
   ASYNC PI SCOREBOARD QUEUE
 *************************************************************/
@@ -47,7 +49,8 @@ const char* SCOREBOARD_UPDATE_URL = "http://10.42.0.1:5000/update_score";
 enum PiJobType : uint8_t {
   PI_JOB_START,
   PI_JOB_UPDATE,
-  PI_JOB_END
+  PI_JOB_END,
+  PI_JOB_STATS
 };
 
 struct PiJob {
@@ -62,6 +65,8 @@ struct PiJob {
   char reason[80];
   char currentRecipe[MAX_RECIPE_NAME_LENGTH];
   char nextRecipe[MAX_RECIPE_NAME_LENGTH];
+
+  char statsJson[1600];
 };
 
 QueueHandle_t piQueue = nullptr;
@@ -76,8 +81,10 @@ bool connectedToScoreboard = false;
 // Scoreboard reconnect settings.
 // Keep attempts short so the game can run even if the Pi is off/unplugged
 unsigned long lastScoreboardReconnectAttemptMs = 0;
-const unsigned long SCOREBOARD_RECONNECT_INTERVAL_MS = 10000UL;
-const unsigned long SCOREBOARD_CONNECT_TIMEOUT_MS = 750UL;
+const unsigned long SCOREBOARD_RECONNECT_INTERVAL_MS = 5000UL;
+
+const unsigned long SCOREBOARD_CONNECT_TIMEOUT_IDLE_MS = 3000UL;
+const unsigned long SCOREBOARD_CONNECT_TIMEOUT_GAME_MS = 300UL;
 
 bool piStartSentForCurrentGame = false;
 
@@ -215,6 +222,28 @@ bool pendingRecipeBroadcast = false;
 unsigned long recipeBroadcastAt = 0;
 
 /*************************************************************
+  GAME STATS TRACKING
+*************************************************************/
+
+struct LecRoundStats {
+  bool played;
+  unsigned long startedAtMs;
+  unsigned long endedAtMs;
+  unsigned long durationMs;
+  int targetServes;
+  int completedServes;
+  bool completed;
+};
+
+unsigned long statsGameStartedAtMs = 0;
+unsigned long statsGameEndedAtMs = 0;
+
+LecRoundStats statsRound1;
+LecRoundStats statsRound2;
+
+int statsFireCount = 0;
+
+/*************************************************************
   BUTTON STATE
 *************************************************************/
 
@@ -255,6 +284,18 @@ void queuePiUpdate(int score, int timeLeftSec);
 void performPiStartGame(const PiJob& job);
 void performPiEndGame(const PiJob& job);
 void performPiUpdate(const PiJob& job);
+
+LecRoundStats* getStatsForRound(LecRound round);
+void resetStatsTracking();
+void beginStatsGame();
+void beginStatsRound(LecRound round);
+void finalizeStatsRound(LecRound round, bool completed);
+void finalizeStatsGame();
+
+String jsonEscape(const String& value);
+String buildStatsPayload(const String& reason, int finalScore);
+void queuePiStatsPost(const String& payload);
+void performPiStatsPost(const PiJob& job);
 
 void handleSerialCommands();
 void handleButtons();
@@ -522,7 +563,7 @@ bool tryConnectToScoreboardOnce(unsigned long timeoutMs) {
 void connectToScoreboardWithTimeout() {
   Serial.println("Connecting to scoreboard AP...");
 
-  if (!tryConnectToScoreboardOnce(10000UL)) {
+  if (!tryConnectToScoreboardOnce(45000UL)) {
     Serial.println("Scoreboard AP unavailable at boot. Continuing with ESP-NOW only.");
     Serial.println("Will keep retrying scoreboard connection in background.");
   }
@@ -569,8 +610,12 @@ void processScoreboardReconnect() {
 
   Serial.println("Attempting scoreboard reconnect...");
 
-  bool reconnected = tryConnectToScoreboardOnce(SCOREBOARD_CONNECT_TIMEOUT_MS);
+  unsigned long timeoutMs = gameRunning
+    ? SCOREBOARD_CONNECT_TIMEOUT_GAME_MS
+    : SCOREBOARD_CONNECT_TIMEOUT_IDLE_MS;
 
+  bool reconnected = tryConnectToScoreboardOnce(timeoutMs);
+  
   if (reconnected && gameRunning) {
     Serial.println("Scoreboard reconnected during active game. Sending state.");
 
@@ -776,6 +821,11 @@ void handleSerialCommands() {
 
     broadcastCurrentRecipe();
   } else if (lowerCmd == "fire") {
+
+    if (gameRunning && !onFire) {
+      statsFireCount++;
+    }
+
     onFire = true;
     digitalWrite(FIRE_LED_PIN, HIGH);
     broadcastFireState(true);
@@ -823,30 +873,19 @@ void handleGreenButton() {
   } else {
     if (greenButtonPressStartTime != 0) {
       unsigned long pressDuration = millis() - greenButtonPressStartTime;
-
+  
       if (!greenButtonLongPressHandled && pressDuration < LEC_LONG_PRESS_DURATION_MS) {
         blinkButtonLED(GREEN_BUTTON_LED_PIN);
 
         if (!gameRunning) {
           startGame();
-        } else {
-          pickRecipeForRound(currentRound, currentRecipe, currentRecipeValid);
-
-          pickDifferentRecipeForRound(
-            currentRound,
-            currentRecipeValid ? currentRecipe.name : "",
-            nextRecipe,
-            nextRecipeValid
-          );
-
-          broadcastCurrentRecipe();
-        }
-      }
+        } 
 
       greenButtonPressStartTime = 0;
       greenButtonLongPressHandled = false;
     }
   }
+}
 }
 
 void handleRedButton() {
@@ -941,6 +980,115 @@ void handleDebugLog(const uint8_t* mac, const LecPacket& packet) {
 #endif
 }
 
+LecRoundStats* getStatsForRound(LecRound round) {
+  if (round == LEC_ROUND_1) {
+    return &statsRound1;
+  }
+
+  if (round == LEC_ROUND_2) {
+    return &statsRound2;
+  }
+
+  return nullptr;
+}
+
+void resetStatsTracking() {
+  statsGameStartedAtMs = 0;
+  statsGameEndedAtMs = 0;
+  statsFireCount = 0;
+
+  statsRound1 = {
+    false,
+    0,
+    0,
+    0,
+    LEC_ROUND_1_SERVE_TARGET,
+    0,
+    false
+  };
+
+  statsRound2 = {
+    false,
+    0,
+    0,
+    0,
+    LEC_ROUND_2_SERVE_TARGET,
+    0,
+    false
+  };
+}
+
+void beginStatsGame() {
+  resetStatsTracking();
+  statsGameStartedAtMs = millis();
+
+  Serial.println("Stats tracking started for new game.");
+}
+
+void beginStatsRound(LecRound round) {
+  LecRoundStats* stats = getStatsForRound(round);
+
+  if (stats == nullptr) {
+    return;
+  }
+
+  stats->played = true;
+  stats->startedAtMs = millis();
+  stats->endedAtMs = 0;
+  stats->durationMs = 0;
+  stats->completedServes = 0;
+  stats->completed = false;
+
+  if (round == LEC_ROUND_1) {
+    stats->targetServes = LEC_ROUND_1_SERVE_TARGET;
+  } else if (round == LEC_ROUND_2) {
+    stats->targetServes = LEC_ROUND_2_SERVE_TARGET;
+  }
+
+  Serial.print("Stats tracking started for round ");
+  Serial.println(static_cast<int>(round));
+}
+
+void finalizeStatsRound(LecRound round, bool completed) {
+  LecRoundStats* stats = getStatsForRound(round);
+
+  if (stats == nullptr || !stats->played) {
+    return;
+  }
+
+  if (stats->endedAtMs > 0) {
+    return;
+  }
+
+  stats->endedAtMs = millis();
+
+  if (stats->startedAtMs > 0) {
+    stats->durationMs = stats->endedAtMs - stats->startedAtMs;
+  }
+
+  stats->completedServes = correctServesInRound;
+  stats->completed = completed;
+
+  Serial.print("Stats finalized for round ");
+  Serial.print(static_cast<int>(round));
+  Serial.print(" | completed: ");
+  Serial.print(completed ? "true" : "false");
+  Serial.print(" | duration ms: ");
+  Serial.println(stats->durationMs);
+}
+
+void finalizeStatsGame() {
+  statsGameEndedAtMs = millis();
+
+  Serial.print("Stats finalized for game. Duration ms: ");
+
+  if (statsGameStartedAtMs > 0) {
+    Serial.println(statsGameEndedAtMs - statsGameStartedAtMs);
+  } else {
+    Serial.println(0);
+  }
+}
+
 /*************************************************************
   GAME FLOW
 *************************************************************/
@@ -967,6 +1115,8 @@ void startGame() {
   pendingPiStartGame = false;
   pendingPiStartDurationSec = 0;
 
+  beginStatsGame();
+
   startRound(LEC_ROUND_1);
 }
 
@@ -988,12 +1138,11 @@ void startRound(LecRound round) {
 
   roundStartTime = millis();
 
+  beginStatsRound(round);
+
   Serial.print("Starting round: ");
   Serial.println(static_cast<int>(currentRound));
 
-  // Tell clients the round started.
-  // Round 1 clients play countdown 0x13 here.
-  // Round 2 clients wait for role assignment/tornado.
   broadcastStartRound(currentRound);
 
   assignRolesForCurrentRound();
@@ -1033,13 +1182,18 @@ void endCurrentRound() {
   Serial.println(static_cast<int>(currentRound));
 
   if (correctServesInRound < getServeTargetForRound(currentRound)) {
+    finalizeStatsRound(currentRound, false);
+
     if (currentRound == LEC_ROUND_1) {
       endGame("not enough round 1 orders served");
     } else if (currentRound == LEC_ROUND_2) {
       endGame("not enough round 2 orders served");
     }
+
     return;
   }
+
+  finalizeStatsRound(currentRound, true);
 
   if (currentRound == LEC_ROUND_1) {
     pendingRoundTransition = true;
@@ -1056,6 +1210,15 @@ void endGame(const String& reason) {
   Serial.println(reason);
   Serial.print("Final score: ");
   Serial.println(playerScore);
+
+  if (currentRound != LEC_ROUND_NONE) {
+    finalizeStatsRound(currentRound, false);
+  }
+
+  finalizeStatsGame();
+
+  String statsPayload = buildStatsPayload(reason, playerScore);
+  queuePiStatsPost(statsPayload);
 
   gameRunning = false;
   currentRound = LEC_ROUND_NONE;
@@ -1109,6 +1272,8 @@ void resetGameState() {
   pendingRecipeBroadcast = false;
 
   pendingRoleAssignmentBroadcast = false;
+
+  resetStatsTracking();
 
   digitalWrite(FIRE_LED_PIN, LOW);
 
@@ -1807,6 +1972,8 @@ void handleFireRequest(const uint8_t* mac, const LecPacket& packet) {
   }
 
   Serial.println("Fire triggered by client.");
+
+  statsFireCount++;
 
   onFire = true;
   digitalWrite(FIRE_LED_PIN, HIGH);
@@ -2535,6 +2702,10 @@ void piScoreboardTask(void* parameter) {
         case PI_JOB_END:
           performPiEndGame(job);
           break;
+
+        case PI_JOB_STATS:
+          performPiStatsPost(job);
+          break;
       }
     }
   }
@@ -2596,6 +2767,202 @@ void queuePiUpdate(int score, int timeLeftSec) {
   }
 
   xQueueSend(piQueue, &job, 0);
+}
+
+String jsonEscape(const String& value) {
+  String escaped = "";
+
+  for (int i = 0; i < value.length(); i++) {
+    char c = value.charAt(i);
+
+    if (c == '"') {
+      escaped += "\\\"";
+    } else if (c == '\\') {
+      escaped += "\\\\";
+    } else if (c == '\n') {
+      escaped += "\\n";
+    } else if (c == '\r') {
+      escaped += "\\r";
+    } else if (c == '\t') {
+      escaped += "\\t";
+    } else {
+      escaped += c;
+    }
+  }
+
+  return escaped;
+}
+
+String buildStatsPayload(const String& reason, int finalScore) {
+  unsigned long gameDurationMs = 0;
+
+  if (statsGameStartedAtMs > 0 && statsGameEndedAtMs > statsGameStartedAtMs) {
+    gameDurationMs = statsGameEndedAtMs - statsGameStartedAtMs;
+  }
+
+  bool completed = statsRound2.completed;
+
+  int recipesCompleted =
+    statsRound1.completedServes +
+    statsRound2.completedServes;
+
+  int stars = 0;
+
+  if (finalScore >= starThresholds[0]) stars = 1;
+  if (finalScore >= starThresholds[1]) stars = 2;
+  if (finalScore >= starThresholds[2]) stars = 3;
+
+  String escapedReason = jsonEscape(reason);
+
+  String json = "{";
+
+  json += "\"startedAtMs\":";
+  json += String(statsGameStartedAtMs);
+  json += ",";
+
+  json += "\"endedAtMs\":";
+  json += String(statsGameEndedAtMs);
+  json += ",";
+
+  json += "\"gameDurationMs\":";
+  json += String(gameDurationMs);
+  json += ",";
+
+  json += "\"completed\":";
+  json += completed ? "true" : "false";
+  json += ",";
+
+  json += "\"finalScore\":";
+  json += String(finalScore);
+  json += ",";
+
+  json += "\"stars\":";
+  json += String(stars);
+  json += ",";
+
+  json += "\"recipesCompleted\":";
+  json += String(recipesCompleted);
+  json += ",";
+
+  json += "\"fireCount\":";
+  json += String(statsFireCount);
+  json += ",";
+
+  json += "\"failureReason\":";
+
+  if (completed) {
+    json += "null";
+  } else {
+    json += "\"";
+    json += escapedReason;
+    json += "\"";
+  }
+
+  json += ",";
+
+  json += "\"rounds\":[";
+
+  if (statsRound1.played) {
+    json += "{";
+    json += "\"roundNumber\":1,";
+    json += "\"startedAtMs\":";
+    json += String(statsRound1.startedAtMs);
+    json += ",";
+    json += "\"endedAtMs\":";
+    json += String(statsRound1.endedAtMs);
+    json += ",";
+    json += "\"durationMs\":";
+    json += String(statsRound1.durationMs);
+    json += ",";
+    json += "\"targetServes\":";
+    json += String(statsRound1.targetServes);
+    json += ",";
+    json += "\"completedServes\":";
+    json += String(statsRound1.completedServes);
+    json += ",";
+    json += "\"completed\":";
+    json += statsRound1.completed ? "true" : "false";
+    json += "}";
+  }
+
+  if (statsRound1.played && statsRound2.played) {
+    json += ",";
+  }
+
+  if (statsRound2.played) {
+    json += "{";
+    json += "\"roundNumber\":2,";
+    json += "\"startedAtMs\":";
+    json += String(statsRound2.startedAtMs);
+    json += ",";
+    json += "\"endedAtMs\":";
+    json += String(statsRound2.endedAtMs);
+    json += ",";
+    json += "\"durationMs\":";
+    json += String(statsRound2.durationMs);
+    json += ",";
+    json += "\"targetServes\":";
+    json += String(statsRound2.targetServes);
+    json += ",";
+    json += "\"completedServes\":";
+    json += String(statsRound2.completedServes);
+    json += ",";
+    json += "\"completed\":";
+    json += statsRound2.completed ? "true" : "false";
+    json += "}";
+  }
+
+  json += "]";
+  json += "}";
+
+  return json;
+}
+
+void queuePiStatsPost(const String& payload) {
+  if (!connectedToScoreboard || piQueue == nullptr) {
+    Serial.println("Stats post skipped: scoreboard/Pi not connected.");
+    return;
+  }
+
+  PiJob job = {};
+  job.type = PI_JOB_STATS;
+
+  strncpy(job.statsJson, payload.c_str(), sizeof(job.statsJson) - 1);
+  job.statsJson[sizeof(job.statsJson) - 1] = '\0';
+
+  BaseType_t queued = xQueueSend(piQueue, &job, 0);
+
+  if (queued != pdTRUE) {
+    Serial.println("Stats post skipped: Pi queue full.");
+    return;
+  }
+
+  Serial.println("Stats post queued.");
+}
+
+void performPiStatsPost(const PiJob& job) {
+  HTTPClient http;
+  http.setTimeout(PI_HTTP_TIMEOUT_MS);
+
+  bool began = http.begin(STATS_RESULT_URL);
+
+  if (!began) {
+#if LEC_DEBUG
+    Serial.println("Stats HTTP begin failed.");
+#endif
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.POST(String(job.statsJson));
+
+  http.end();
+
+#if LEC_DEBUG
+  Serial.print("Async stats HTTP: ");
+  Serial.println(httpCode);
+#endif
 }
 
 void performPiStartGame(const PiJob& job) {
