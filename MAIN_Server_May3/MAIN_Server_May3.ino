@@ -258,6 +258,10 @@ unsigned long fireButtonPressStartTime = 0;
 unsigned long lastFireBlinkTime = 0;
 bool fireLedState = LOW;
 
+const unsigned long START_BUTTON_BLINK_INTERVAL_MS = 500;
+unsigned long lastStartButtonBlinkTime = 0;
+bool startButtonLedState = LOW;
+
 /*************************************************************
   FUNCTION PROTOTYPES
 *************************************************************/
@@ -302,6 +306,7 @@ void handleButtons();
 void handleGreenButton();
 void handleRedButton();
 void handleFireButton();
+void processStartButtonBlink();
 
 void startGame();
 void startRound(LecRound round);
@@ -499,6 +504,7 @@ void loop() {
 
   handleSerialCommands();
   handleButtons();
+  processStartButtonBlink();
 
   processRoundTransition();
 
@@ -864,6 +870,22 @@ void handleButtons() {
   handleFireButton();
 }
 
+void processStartButtonBlink() {
+  if (gameRunning) {
+    startButtonLedState = LOW;
+    digitalWrite(GREEN_BUTTON_LED_PIN, LOW);
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastStartButtonBlinkTime >= START_BUTTON_BLINK_INTERVAL_MS) {
+    lastStartButtonBlinkTime = now;
+    startButtonLedState = !startButtonLedState;
+    digitalWrite(GREEN_BUTTON_LED_PIN, startButtonLedState);
+  }
+}
+
 void handleGreenButton() {
   if (digitalRead(GREEN_BUTTON_PIN) == LOW) {
     if (greenButtonPressStartTime == 0) {
@@ -1098,6 +1120,9 @@ void startGame() {
     Serial.println("Game already running.");
     return;
   }
+
+  startButtonLedState = LOW;
+  digitalWrite(GREEN_BUTTON_LED_PIN, LOW);
 
   resetAllPlates();
 
