@@ -550,8 +550,9 @@ void loop() {
   processPendingRecipeBroadcast();
   processCountdownAndScoreboard();
 
-  if (gameRunning && roundDuration > 0) {
-    if (millis() - roundStartTime >= roundDuration) {
+  if (gameRunning) {
+    if (roundDuration == 0 ||
+        millis() - roundStartTime >= roundDuration) {
       endCurrentRound();
     }
   }
@@ -1158,9 +1159,11 @@ void startGame() {
     return;
   }
 
-  // Fire and forget PMS telemetry
-  // PMS failure never prevents gameplay
-  pms.startAttempt();
+  bool pmsStarted =
+    pms.startAttempt();
+    
+  Serial.print("[PMS] Start requested: ");
+  Serial.println(pmsStarted ? "true" : "false");
 
   startButtonLedState = LOW;
   digitalWrite(GREEN_BUTTON_LED_PIN, LOW);
@@ -1276,6 +1279,13 @@ void endGame(const String& reason) {
   Serial.println(reason);
   Serial.print("Final score: ");
   Serial.println(playerScore);
+
+  Serial.print("[PMS] Active attempt at end: ");
+  Serial.println(
+    pms.hasActiveAttempt()
+        ? "true"
+        : "false"
+  );
 
   /***********************************************************
     PMS ATTEMPT RESULT
