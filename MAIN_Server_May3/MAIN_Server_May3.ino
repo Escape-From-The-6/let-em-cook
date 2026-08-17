@@ -17,6 +17,7 @@
 #define LEC_DEBUG 0
 
 #include <LetEmCook.h>
+#include <PmsClient.h>
 
 #include <esp_now.h>
 #include <WiFi.h>
@@ -41,6 +42,19 @@ const char* SCOREBOARD_END_URL    = "http://10.42.0.1:5000/end_game";
 const char* SCOREBOARD_UPDATE_URL = "http://10.42.0.1:5000/update_score";
 
 const char* STATS_RESULT_URL = "http://10.42.0.1:5001/api/game-result";
+
+
+/*************************************************************
+  PMS CONFIG
+*************************************************************/
+
+static const char* PMS_HARDWARE_ID =
+  "LET-EM-COOK-ESP32";
+
+static const char* PMS_FIRMWARE_VERSION =
+  "1.0.0";
+
+PmsClient pms;
 
 /*************************************************************
   ASYNC PI SCOREBOARD QUEUE
@@ -484,6 +498,27 @@ void setup() {
 
   initializeHardware();
   initializeEspNow();
+
+  /*************************************************************
+    PMS
+  *************************************************************/
+
+  PmsConfig pmsConfig;
+
+  pmsConfig.hardwareId =
+    PMS_HARDWARE_ID;
+
+  pmsConfig.firmwareVersion =
+    PMS_FIRMWARE_VERSION;
+
+  pmsConfig.wifiChannel =
+    LEC_ESPNOW_CHANNEL;
+
+  pmsConfig.heartbeatIntervalMs =
+    30000;
+
+  pms.begin(pmsConfig);
+
   initializePlates();
 
   currentRound = LEC_ROUND_NONE;
@@ -497,6 +532,8 @@ void setup() {
 *************************************************************/
 
 void loop() {
+  pms.loop();
+
   processIncomingPackets();
 
   processScoreboardReconnect();
@@ -1121,6 +1158,10 @@ void startGame() {
     return;
   }
 
+  // Fire and forget PMS telemetry
+  // PMS failure never prevents gameplay
+  pms.startAttempt();
+
   startButtonLedState = LOW;
   digitalWrite(GREEN_BUTTON_LED_PIN, LOW);
 
@@ -1236,13 +1277,44 @@ void endGame(const String& reason) {
   Serial.print("Final score: ");
   Serial.println(playerScore);
 
+  /***********************************************************
+    PMS ATTEMPT RESULT
+  ***********************************************************/
+
+  if (pms.hasActiveAttempt()) {
+    if (reason == "Round 2 complete") {
+      // Genuine successful completion.
+      pms.completeAttempt(
+        playerScore,
+        true
+      );
+
+    } else if (
+      reason == "Red Button Press" ||
+      reason == "Serial Command"
+    ) {
+      // Staff/operator termination is not a player failure.
+      pms.cancelAttempt();
+
+    } else {
+      // Anything else reaching endGame represents an
+      // unsuccessful game attempt.
+      pms.completeAttempt(
+        playerScore,
+        false
+      );
+    }
+  }
+
   if (currentRound != LEC_ROUND_NONE) {
     finalizeStatsRound(currentRound, false);
   }
 
   finalizeStatsGame();
 
-  String statsPayload = buildStatsPayload(reason, playerScore);
+  String statsPayload =
+    buildStatsPayload(reason, playerScore);
+
   queuePiStatsPost(statsPayload);
 
   gameRunning = false;
@@ -1267,16 +1339,24 @@ void endGame(const String& reason) {
   audioModule.stop();
   audioModule.playSpecified(3);
 
-  notifyPiEndGame(reason, playerScore);
+  notifyPiEndGame(
+    reason,
+    playerScore
+  );
 
   resetAllPlates();
 
   delay(2000);
+
   broadcastReinitialize();
 }
 
 void resetGameState() {
   Serial.println("Resetting server game state.");
+
+  if (pms.hasActiveAttempt()) {
+    pms.cancelAttempt();
+  }
 
   gameRunning = false;
   onFire = false;
